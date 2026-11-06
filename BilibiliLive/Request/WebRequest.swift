@@ -689,7 +689,7 @@ extension WebRequest {
     }
 }
 
-extension WebRequest.UpSpaceInfo : AvatarProviding {
+extension WebRequest.UpSpaceInfo: AvatarProviding {
     var avatar: URL? { face }
 }
 

@@ -28,4 +28,57 @@ platform :tvos do
     sh "cd .. && mv BilbiliAtvDemo.zip BilbiliAtvDemo.ipa"
     sh "cd .. && rm -rf Payload *.xcarchive *.zip || true"
   end
+
+  desc "签名打包并上传 TestFlight（内部测试），build 号自动在 TestFlight 最新值上 +1"
+  lane :beta do
+    key_id = ENV.fetch("ASC_KEY_ID")
+    issuer_id = ENV.fetch("ASC_ISSUER_ID")
+    key_path = File.expand_path(ENV.fetch("ASC_KEY_PATH"))
+
+    api_key = app_store_connect_api_key(
+      key_id: key_id,
+      issuer_id: issuer_id,
+      key_filepath: key_path
+    )
+
+    build_number = latest_testflight_build_number(
+      api_key: api_key,
+      platform: "appletvos",
+      initial_build_number: 0
+    ) + 1
+    UI.message("本次 build 号: #{build_number}")
+
+    # Release 配置在工程里是手动签名：Apple Distribution + 描述文件 "BilibiliLive AppStore"。
+    # （自动签名在 Archive 时会要求 Development 描述文件，而那需要团队里已注册设备。）
+    # 这两步用 API Key 自动复用/创建 Distribution 证书和 App Store 描述文件并装到本机。
+    get_certificates(api_key: api_key)
+    get_provisioning_profile(
+      api_key: api_key,
+      platform: "tvos",
+      provisioning_name: "BilibiliLive AppStore",
+      ignore_profiles_with_different_name: true
+    )
+
+    # 注意：不要把 derived_data_path / archive_path 放进仓库目录，
+    # 工程里的 SwiftFormat 构建脚本会扫描整个 $SRCROOT。
+    ipa = build_app(
+      scheme: "BilibiliLive",
+      configuration: "Release",
+      destination: "generic/platform=tvOS",
+      export_method: "app-store",
+      export_options: {
+        provisioningProfiles: { CredentialsManager::AppfileConfig.try_fetch_value(:app_identifier) => "BilibiliLive AppStore" }
+      },
+      output_directory: "build",
+      output_name: "BilibiliLive.ipa",
+      xcargs: "CURRENT_PROJECT_VERSION=#{build_number}"
+    )
+
+    upload_to_testflight(
+      api_key: api_key,
+      ipa: ipa,
+      app_platform: "appletvos",
+      skip_waiting_for_build_processing: true
+    )
+  end
 end

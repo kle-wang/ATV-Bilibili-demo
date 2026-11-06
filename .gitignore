@@ -88,3 +88,13 @@ iOSInjectionProject/
 
 # End of https://www.toptal.com/developers/gitignore/api/swift
 fastlane/README.md
+
+# TestFlight 签名密钥（勿提交）
+fastlane/.env
+*.p8
+vendor/bundle/
+# fastlane 生成的签名文件（含私钥，勿提交）
+*.p12
+*.cer
+*.certSigningRequest
+*.mobileprovision

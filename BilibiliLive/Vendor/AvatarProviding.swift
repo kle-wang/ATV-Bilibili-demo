@@ -16,7 +16,7 @@ extension AvatarProviding {
         guard let avatar else {
             return nil
         }
-        
+
         return avatar
             .deletingLastPathComponent()
             .appending(component: avatar.lastPathComponent + "@\(size)w_\(size)h.jpg")

@@ -86,6 +86,13 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
     private var startupRetryCount = 0
     private let maxStartupRetries = 1
     private let startupTimeout: TimeInterval = 15
+    private let stallRecoveryTimeout: TimeInterval = 10
+    /// 看门狗重建后要恢复到的位置，在新资源 readyToPlay 时由 playerWillStart 跳转
+    private var pendingResumeTime: Double?
+    /// 开播阶段的前向缓冲，播起来后恢复为 steadyForwardBuffer
+    private let startupForwardBuffer: TimeInterval = 3
+    private let steadyForwardBuffer: TimeInterval = 15
+    private var startupBoostObservation: NSKeyValueObservation?
 
     init(playInfo: PlayInfo,
          detailData: PlayerDetailData,
@@ -141,7 +148,10 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
     }
 
     func playerWillStart(player: AVPlayer) {
-        if let playerStartPos = playData.playerStartPos {
+        if let resumeTime = pendingResumeTime {
+            pendingResumeTime = nil
+            player.seek(to: CMTime(seconds: resumeTime, preferredTimescale: 1), toleranceBefore: .zero, toleranceAfter: .zero)
+        } else if let playerStartPos = playData.playerStartPos {
             player.seek(to: CMTime(seconds: Double(playerStartPos), preferredTimescale: 1), toleranceBefore: .zero, toleranceAfter: .zero)
         }
     }
@@ -231,6 +241,7 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
         Logger.info("playback host \(host) observed \(observed)Mbps indicated \(indicated)Mbps effective \(effective)Mbps stalls \(stalls)(+\(stallDelta)) dropped \(dropped)(+\(dropped - lastDroppedFrames)) serverChanges \(event.numberOfServerAddressChanges) tcs \(tcs.rawValue) wait \(waiting) keepUp \(keepUp) buffered \(String(format: "%.1f", buffered))s")
         lastStalls = stalls
         lastDroppedFrames = dropped
+        PlaybackThroughputEstimator.record(observedBps: observedBps)
         // 真正播起来后归还起播重试额度，后续切画质/换源卡住时仍可再兜底一次
         if tcs == .playing {
             startupRetryCount = 0
@@ -449,6 +460,7 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
         acceleratedRecoveryAttempts = 0
         acceleratedWaitingSince = nil
         startupRetryCount = 0
+        pendingResumeTime = nil
         transportMode = Settings.multiCDNEnabled ? .accelerated : .direct
         let generation = beginLoadGeneration()
         loadTask = Task { @MainActor [weak self] in
@@ -537,7 +549,9 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
             playerVC.appliesPreferredDisplayCriteriaAutomatically = shouldApplyContentMatch(delegate: delegate)
         }
 
-        await prepare(toPlay: asset, generation: generation)
+        // 沉浸式预缓冲过的资源直接接手那个已缓冲的播放器，开头几秒无需再下载
+        let prewarmedPlayer = prepared.takePrewarmedPlayer()
+        await prepare(toPlay: asset, prewarmedPlayer: prewarmedPlayer, generation: generation)
     }
 
     private func preparedMedia(urlInfo: VideoPlayURLInfo,
@@ -557,7 +571,7 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
            forceTransport == nil,
            let mediaWarmupManager
         {
-            let prepared = try await mediaWarmupManager.preparedMedia(for: playInfo)
+            let prepared = try await mediaWarmupManager.takePreparedMedia(for: playInfo)
             transportMode = prepared.delegate.effectiveTransportMode
             return prepared
         }
@@ -690,12 +704,32 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
     }
 
     @MainActor
-    func prepare(toPlay asset: AVURLAsset, generation: Int) async {
+    func prepare(toPlay asset: AVURLAsset, prewarmedPlayer: AVPlayer? = nil, generation: Int) async {
         guard loadGeneration == generation,
               !Task.isCancelled,
               let playerVC
-        else { return }
-        let playerItem = AVPlayerItem(asset: asset)
+        else {
+            prewarmedPlayer?.pause()
+            prewarmedPlayer?.replaceCurrentItem(with: nil)
+            return
+        }
+        let player: AVPlayer
+        let playerItem: AVPlayerItem
+        if let prewarmedPlayer, let item = prewarmedPlayer.currentItem, item.asset === asset, item.status != .failed {
+            player = prewarmedPlayer
+            playerItem = item
+            // 预缓冲是从开头缓冲的；有起播位置（如切回时恢复的进度）就立刻跳过去，
+            // 不等 readyToPlay 回调，避免先从头播一下再跳
+            if let start = playData.playerStartPos, start > 0 {
+                item.seek(to: CMTime(seconds: Double(start), preferredTimescale: 1), toleranceBefore: .zero, toleranceAfter: .zero, completionHandler: nil)
+            }
+            Logger.info("[prebuffer] 接手预缓冲播放器 av\(playData.aid)，已缓冲 \(String(format: "%.1f", bufferedSeconds(of: item)))s")
+        } else {
+            prewarmedPlayer?.pause()
+            prewarmedPlayer?.replaceCurrentItem(with: nil)
+            playerItem = AVPlayerItem(asset: asset)
+            player = AVPlayer(playerItem: playerItem)
+        }
 
         // 设置 preferredPeakBitRate 为一个很高的值，让 AVPlayer 优先选择高码率流
         // 0 表示无限制，让 AVPlayer 根据网络条件自动选择最高可用码率
@@ -705,10 +739,20 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
         // 实测 CDN 吞吐充裕，不再需要这么激进的预缓冲。60s 在连续快进时的副作用是：
         // 每次 seek 都会立刻为新位置起一大批 60s 的 range 请求，下一个 seek 一来又整体取消重来，
         // 密集 seek 下网络连接层疲于开连接/取消，表现为长时间无响应。降到 15s 大幅减少这种抖动。
-        playerItem.preferredForwardBufferDuration = 15
-
-        let player = AVPlayer(playerItem: playerItem)
+        // 开播阶段只攒少量缓冲，真正播起来后再恢复 15s。
+        // 注意不能关闭 automaticallyWaitsToMinimizeStalling：关闭后缓冲一见底 AVPlayer 会直接把 rate 置 0
+        // 且不会自动续播，表现为一直停在暂停状态（真机实测）。
+        playerItem.preferredForwardBufferDuration = startupForwardBuffer
         player.automaticallyWaitsToMinimizeStalling = minimizeStalling
+        startupBoostObservation = player.observe(\.timeControlStatus, options: [.initial, .new]) { [weak self, weak playerItem] observed, _ in
+            guard observed.timeControlStatus == .playing else { return }
+            DispatchQueue.main.async {
+                guard let self, self.playerVC?.player === observed else { return }
+                playerItem?.preferredForwardBufferDuration = self.steadyForwardBuffer
+                self.startupBoostObservation = nil
+            }
+        }
+
         player.isMuted = isMuted
         guard loadGeneration == generation, !Task.isCancelled else {
             player.pause()
@@ -728,13 +772,25 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
     // MARK: - 起播看门狗
 
     @MainActor
-    private func armStartupWatchdog(generation: Int) {
+    private func armStartupWatchdog(generation: Int, timeout: TimeInterval? = nil) {
         startupWatchdog?.cancel()
-        let timeout = startupTimeout
+        let timeout = timeout ?? startupTimeout
         startupWatchdog = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
             guard !Task.isCancelled else { return }
+            self?.startupWatchdog = nil
             await self?.handleStartupTimeout(generation: generation)
+        }
+    }
+
+    /// 播放中卡顿：先交给 AVPlayer 自己恢复，持续一段时间仍无缓冲再原位换节点重建，
+    /// 不再像过去那样整条视频从头重新加载。
+    func playerDidStall(player _: AVPlayer) {
+        guard startupWatchdog == nil else { return }
+        Logger.info("[stall] 播放卡顿，\(Int(stallRecoveryTimeout))s 内未恢复将原位重建")
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.armStartupWatchdog(generation: self.loadGeneration, timeout: self.stallRecoveryTimeout)
         }
     }
 
@@ -765,8 +821,12 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
             .compactMap { URLComponents(string: $0)?.host }
             .first { $0 != currentHost }
         let resumeTime = player.currentTime().seconds
-        Logger.info("[startup] 起播 \(Int(startupTimeout))s 未就绪 (status \(item.status.rawValue), host \(currentHost ?? "-"))，第 \(startupRetryCount) 次重建，改用 \(alternateHost ?? "原地址")")
+        Logger.info("[startup] 播放未就绪或卡住 (status \(item.status.rawValue), at \(Int(resumeTime.isFinite ? resumeTime : 0))s, host \(currentHost ?? "-"))，第 \(startupRetryCount) 次重建，改用 \(alternateHost ?? "原地址")")
 
+        // 播放中卡住：回到卡住的位置；起播阶段卡住（尚未有进度）：沿用原起播位置
+        if resumeTime.isFinite, resumeTime > 1 {
+            pendingResumeTime = resumeTime
+        }
         let newGeneration = beginLoadGeneration()
         loadTask = Task { @MainActor [weak self] in
             guard let self else { return }
@@ -779,12 +839,6 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
                                          preferredHost: alternateHost,
                                          isQualitySwitch: true,
                                          forceTransport: .direct)
-                if resumeTime.isFinite, resumeTime > 0,
-                   self.loadGeneration == newGeneration,
-                   let newPlayer = self.playerVC?.player
-                {
-                    await newPlayer.seek(to: CMTime(seconds: resumeTime, preferredTimescale: 1), toleranceBefore: .zero, toleranceAfter: .zero)
-                }
             } catch is CancellationError {
                 return
             } catch {

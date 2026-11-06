@@ -181,6 +181,27 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
         videoInfo.append(PlaybackInfo(info: info, url: url, duration: duration))
     }
 
+    /// 选起播档位：有实测吞吐时取峰值码率不超过吞吐 60% 的最高一档；
+    /// 没有实测时取平均码率不超过 2.5Mbps 的最高一档；都不满足时取最低一档。
+    /// videos 须已按码率降序排列。
+    private static func startupVariantIndex(in videos: [VideoPlayURLInfo.DashInfo.DashMediaInfo]) -> Int? {
+        guard !videos.isEmpty else { return nil }
+        let observed = PlaybackThroughputEstimator.observedBps
+        if observed > 0 {
+            let budget = observed * 0.6
+            if let index = videos.firstIndex(where: { Double(peakBandwidth(forAverage: $0.bandwidth)) <= budget }) {
+                return index
+            }
+            return videos.count - 1
+        }
+        // 没有实测时按约 2.5Mbps 平均码率起播（真机实测部分节点只有 2Mbps 左右，
+        // 同为 1080P 的流码率可达 4Mbps 以上，按画质 qn 选会起播即卡）
+        if let index = videos.firstIndex(where: { $0.bandwidth <= 2_500_000 }) {
+            return index
+        }
+        return videos.count - 1
+    }
+
     private func collectCDNCandidates(from video: VideoPlayURLInfo.DashInfo.DashMediaInfo?) {
         guard let video else {
             cdnCandidates = []
@@ -419,16 +440,26 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
             videos = highQualityVideos + fallbackVideos + emergencyVideos
         }
 
-        // 按 bandwidth 降序排序（码率最高的优先，让 AVPlayer 优先选择）
-        // 这样可以确保在同一画质等级下，AVPlayer 会选择码率最高的流
+        // 按 bandwidth 降序排序，同一画质+编码只保留码率最高的一条
         videos.sort { $0.bandwidth > $1.bandwidth }
+        var seenVariants = Set<String>()
+        videos = videos.filter { seenVariants.insert("\($0.id)-\($0.codecs)").inserted }
 
         collectCDNCandidates(from: videos.first)
 
-        // 添加所有 CDN 节点的 URL，让 AVPlayer 自动选择最快的
-        // 这样可以解决单个 CDN 节点速度慢的问题
+        // AVPlayer 用 master playlist 里第一个 variant 起播。过去最高画质（4K 30~44Mbps）排第一，
+        // 起播要从 4K 逐档降到能播的档位，白白耗掉 3~5s。这里把码率适中的一档放到第一位，
+        // 播起来后再由 AVPlayer 按实测带宽自动升档。
+        if videos.count > 1, let startIndex = Self.startupVariantIndex(in: videos) {
+            let start = videos.remove(at: startIndex)
+            videos.insert(start, at: 0)
+            Logger.info("startup variant qn \(start.id) \(start.bandwidth / 1000)kbps (observed \(Int(PlaybackThroughputEstimator.observedBps / 1000))kbps)")
+        }
+
+        // 每档只写一条 variant（该流的首选 URL）。备用 CDN 由 sidx 下载时的多地址回退
+        // 和播放中的换节点逻辑处理，不再在 master 里按 host 重复列同一档。
         for video in videos {
-            for url in video.playableURLs {
+            if let url = video.playableURLs.first {
                 addVideoPlayBackInfo(info: video, url: url, duration: info.dash.duration)
             }
         }
@@ -1048,5 +1079,26 @@ actor SidxDownloader {
             Logger.warn("sidx download failed in \(elapsedMs(since: start))ms on \(host), try next url")
         }
         return nil
+    }
+}
+
+/// 最近一次播放实测的下载吞吐（AVPlayer access log 的 observedBitrate），
+/// 用于给下一个视频选择起播档位。只保存在内存里，App 重启后从默认档起播。
+enum PlaybackThroughputEstimator {
+    private static let lock = NSLock()
+    private static var _observedBps: Double = 0
+
+    static var observedBps: Double {
+        lock.lock()
+        defer { lock.unlock() }
+        return _observedBps
+    }
+
+    /// 平滑更新，避免单次抖动让起播档位大起大落
+    static func record(observedBps sample: Double) {
+        guard sample.isFinite, sample > 0 else { return }
+        lock.lock()
+        _observedBps = _observedBps > 0 ? _observedBps * 0.7 + sample * 0.3 : sample
+        lock.unlock()
     }
 }

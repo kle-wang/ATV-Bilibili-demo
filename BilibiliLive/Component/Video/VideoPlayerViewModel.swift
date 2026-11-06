@@ -230,7 +230,23 @@ class VideoPlayerViewModel {
         }
     }
 
+    /// 由播放器提供当前播放秒数，切换视频前用于记录进度
+    var currentTimeProvider: (() -> Int?)?
+    /// 本次沉浸式会话内各视频离开时的进度（key: aid-cid），切回时从这里继续，不重新播放
+    private var resumePositions = [String: Int]()
+
+    private static func resumeKey(aid: Int, cid: Int?) -> String {
+        "\(aid)-\(cid ?? 0)"
+    }
+
+    private func rememberCurrentPosition() {
+        guard let seconds = currentTimeProvider?(), seconds >= 1 else { return }
+        resumePositions[Self.resumeKey(aid: playInfo.aid, cid: playInfo.cid)] = seconds
+        Logger.info("[FeedFlow] 记录进度 av\(playInfo.aid) \(seconds)s")
+    }
+
     private func updatePlayInfo(_ newPlayInfo: PlayInfo) {
+        rememberCurrentPosition()
         playInfo = newPlayInfo
         onPlayInfoChanged?(newPlayInfo)
         startLoad(for: newPlayInfo)
@@ -242,6 +258,12 @@ class VideoPlayerViewModel {
                                         playTimeInSecond: Int,
                                         playInfo: PlayInfo) -> Int?
     {
+        if let resume = resumePositions[Self.resumeKey(aid: playInfo.aid, cid: cid)],
+           duration - resume > 5
+        {
+            Logger.info("[FeedFlow] 从记录的进度继续 av\(playInfo.aid) \(resume)s")
+            return resume
+        }
         if let startTimeOverride,
            startTimeOverrideContentIdentity == playInfo.contentIdentity,
            duration - startTimeOverride > 5
@@ -283,21 +305,43 @@ class VideoPlayerViewModel {
         updatePlayInfo(temporaryPlayInfo)
     }
 
+    /// 沉浸式模式提前缓冲的条数和每条缓冲时长
+    static let feedFlowPrebufferCount = 4
+    static let feedFlowPrebufferSeconds: Double = 15
+
     func preloadNeighborsIfNeeded() async {
         guard playMode == .feedFlow, let playContextCache, let sequenceProvider else { return }
         let current = sequenceProvider.current() ?? currentPlayInfo
-        let priority = [current,
-                        sequenceProvider.peekNext(),
-                        sequenceProvider.peekPrevious()].compactMap { $0 }.uniqued()
-        for info in priority {
+        let upcoming = sequenceProvider.peekNext(count: Self.feedFlowPrebufferCount)
+        let previous = sequenceProvider.peekPrevious()
+        let keep = ([current] + upcoming + [previous].compactMap { $0 }).uniqued()
+        for info in keep {
             guard !Task.isCancelled else { return }
             await playContextCache.preload(playInfo: info, mode: .regular)
         }
         guard !Task.isCancelled else { return }
-        await playContextCache.trim(keeping: priority)
-        for info in priority {
+        await playContextCache.trim(keeping: keep)
+        // 当前条已由播放器取走，不再为它重复准备资源；先把下一条、上一条的资源备好，保证切换秒开
+        let warmups = ([upcoming.first, previous].compactMap { $0 }).filter { $0.sequenceKey != current.sequenceKey }.uniqued()
+        for info in warmups {
             guard !Task.isCancelled else { return }
             await mediaWarmupManager?.preload(playInfo: info)
+        }
+    }
+
+    /// 逐条为后面几条视频缓冲开头若干秒。由播放器在当前视频缓冲充足后调用，避免和当前视频抢带宽。
+    func prebufferUpcoming() async {
+        guard playMode == .feedFlow, let sequenceProvider, let mediaWarmupManager else { return }
+        let current = sequenceProvider.current() ?? currentPlayInfo
+        let upcoming = sequenceProvider.peekNext(count: Self.feedFlowPrebufferCount)
+            .filter { $0.sequenceKey != current.sequenceKey }
+        for info in upcoming {
+            guard !Task.isCancelled else { return }
+            await playContextCache?.preload(playInfo: info, mode: .regular)
+            guard !Task.isCancelled else { return }
+            await mediaWarmupManager.prebuffer(playInfo: info,
+                                               seconds: Self.feedFlowPrebufferSeconds,
+                                               timeout: 30)
         }
     }
 

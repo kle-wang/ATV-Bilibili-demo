@@ -94,6 +94,8 @@ class CommonPlayerViewController: UIViewController {
     func playerDidEnd(player: AVPlayer) {}
     func playerDidStall(player: AVPlayer) {}
     func playerDidFail(player: AVPlayer) {}
+    /// 系统信息条（transport bar）即将显示/隐藏，子类可覆盖
+    func transportBarVisibilityWillChange(visible: Bool) {}
 
     func showErrorAlertAndExit(title: String = "播放失败", message: String = "未知错误") {
         let alertController = UIAlertController(title: title, message: message, preferredStyle: .alert)
@@ -116,6 +118,18 @@ class CommonPlayerViewController: UIViewController {
 
     func stopPlayback() {
         cleanUpPlayerOnExit(force: true)
+    }
+
+    var currentPlayer: AVPlayer? {
+        playerVC.player
+    }
+
+    /// 开关系统播放控制条；关闭后 AVKit 不再处理遥控器按键（沉浸式模式自行接管）
+    func setPlaybackControlsEnabled(_ enabled: Bool) {
+        showsPlaybackControls = enabled
+        if isViewLoaded {
+            playerVC.showsPlaybackControls = enabled
+        }
     }
 
     func currentPlaybackTimeInSeconds() -> Int? {
@@ -189,7 +203,8 @@ extension CommonPlayerViewController {
     }
 
     private func observePlayerItem(_ playerItem: AVPlayerItem) {
-        statusObserver = playerItem.observe(\.status, options: [.new, .old]) {
+        // .initial：预缓冲接手的播放器在挂上时可能已是 readyToPlay，不会再收到变化通知
+        statusObserver = playerItem.observe(\.status, options: [.initial, .new, .old]) {
             [weak self] item, _ in
             guard let self, let player = playerVC.player else { return }
             switch item.status {
@@ -236,6 +251,15 @@ extension CommonPlayerViewController: AVPlayerViewControllerDelegate {
             return false
         }
         return false
+    }
+
+    func playerViewController(_ playerViewController: AVPlayerViewController,
+                              willTransitionToVisibilityOfTransportBar visible: Bool,
+                              with coordinator: AVPlayerViewControllerAnimationCoordinator)
+    {
+        coordinator.addCoordinatedAnimations(nil) { [weak self] _ in
+            self?.transportBarVisibilityWillChange(visible: visible)
+        }
     }
 
     @objc func playerViewControllerShouldAutomaticallyDismissAtPictureInPictureStart(_: AVPlayerViewController) -> Bool {

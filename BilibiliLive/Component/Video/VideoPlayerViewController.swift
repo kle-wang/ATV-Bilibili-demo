@@ -7,7 +7,9 @@
 
 import AVKit
 import Combine
+import Kingfisher
 import UIKit
+import UIKit.UIGestureRecognizerSubclass
 
 struct PlayInfo: Hashable {
     var aid: Int
@@ -113,6 +115,12 @@ final class VideoSequenceProvider {
     func peekNext() -> PlayInfo? {
         guard hasNext else { return nil }
         return playSeq[currentIndex + 1]
+    }
+
+    func peekNext(count: Int) -> [PlayInfo] {
+        guard count > 0, hasNext else { return [] }
+        let upper = min(playSeq.count - 1, currentIndex + count)
+        return Array(playSeq[(currentIndex + 1)...upper])
     }
 
     func neighborItems(radius: Int) -> [PlayInfo] {
@@ -228,6 +236,9 @@ class VideoPlayerViewController: CommonPlayerViewController {
     override func viewDidLoad() {
         super.viewDidLoad()
         viewModel.sequenceProvider = sequenceProvider
+        viewModel.currentTimeProvider = { [weak self] in
+            self?.currentPlaybackTimeInSeconds()
+        }
         viewModel.onPlayInfoChanged = { [weak self] info in
             self?.handlePlayInfoChanged(info)
         }
@@ -244,6 +255,10 @@ class VideoPlayerViewController: CommonPlayerViewController {
                 plugins.forEach { self?.addPlugin(plugin: $0) }
                 self?.neighborPreloadTask = Task { [weak self] in
                     await self?.viewModel.preloadNeighborsIfNeeded()
+                    // 当前视频先缓冲够，再逐条预缓冲后面几条，避免抢当前视频的带宽
+                    guard self?.playMode == .feedFlow else { return }
+                    guard await self?.waitForCurrentPlaybackBuffered() == true else { return }
+                    await self?.viewModel.prebufferUpcoming()
                 }
             }
         }.store(in: &cancelable)
@@ -255,16 +270,7 @@ class VideoPlayerViewController: CommonPlayerViewController {
         }
 
         if playMode == .feedFlow {
-            // 添加双击上方向键切回上一条视频的全局手势拦截 (作为面板“上一条”被折叠的补偿方案)
-            let doubleUpTap = UITapGestureRecognizer(target: self, action: #selector(handleDoubleUpTap))
-            doubleUpTap.allowedPressTypes = [NSNumber(value: UIPress.PressType.upArrow.rawValue)]
-            doubleUpTap.numberOfTapsRequired = 2
-            view.addGestureRecognizer(doubleUpTap)
-
-            let doubleDownTap = UITapGestureRecognizer(target: self, action: #selector(handleDoubleDownTap))
-            doubleDownTap.allowedPressTypes = [NSNumber(value: UIPress.PressType.downArrow.rawValue)]
-            doubleDownTap.numberOfTapsRequired = 2
-            view.addGestureRecognizer(doubleDownTap)
+            installFeedFlowRemoteControls()
 
             NotificationCenter.default.addObserver(self,
                                                    selector: #selector(handleInfoActionFocusedNotification(_:)),
@@ -309,8 +315,8 @@ class VideoPlayerViewController: CommonPlayerViewController {
     }
 
     override func playerDidStall(player: AVPlayer) {
-        guard playMode == .feedFlow else { return }
-        attemptRetryOrShowRecovery(message: "播放卡住了，请选择重试或切换下一条。")
+        // 卡顿由 BVideoPlayPlugin 原位恢复（保留播放进度）；这里不再整条重载，
+        // 否则短暂缓冲见底就会让视频从头开始播放。
     }
 
     override func playerDidFail(player: AVPlayer) {
@@ -335,6 +341,10 @@ class VideoPlayerViewController: CommonPlayerViewController {
     private func stopAsyncWork() {
         guard !isStopping else { return }
         isStopping = true
+        chromeVisibilityTimer?.invalidate()
+        chromeVisibilityTimer = nil
+        coverWatchTimer?.invalidate()
+        coverWatchTimer = nil
         neighborPreloadTask?.cancel()
         neighborPreloadTask = nil
         viewModel.cancelLoading()
@@ -392,21 +402,292 @@ class VideoPlayerViewController: CommonPlayerViewController {
         detailVC.present(from: self, direatlyEnterVideo: false)
     }
 
-    @objc private func handleDoubleUpTap() {
-        guard playMode == .feedFlow else { return }
-        Logger.debug("[FeedFlow] 捕获双击上键，准备切换至上一条")
-        Task { [weak self] in
-            guard let self else { return }
-            _ = await self.viewModel.playPreviousFromSequence()
+    /// 等当前视频缓冲到 4s 以上（或已播放 20s 仍不足时放弃）。返回 false 表示被取消或条件不满足。
+    private func waitForCurrentPlaybackBuffered() async -> Bool {
+        let start = ProcessInfo.processInfo.systemUptime
+        while !Task.isCancelled {
+            if let item = currentPlayer?.currentItem,
+               item.status == .readyToPlay,
+               let range = item.loadedTimeRanges.first?.timeRangeValue
+            {
+                let buffered = range.start.seconds + range.duration.seconds - item.currentTime().seconds
+                if buffered.isFinite, buffered >= 4 { return true }
+            }
+            if ProcessInfo.processInfo.systemUptime - start > 20 {
+                Logger.info("[prebuffer] 当前视频 20s 内未缓冲到 4s，跳过预缓冲")
+                return false
+            }
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+        }
+        return false
+    }
+
+    // MARK: - 沉浸式模式遥控器
+
+    //
+    // 使用系统原生信息条（AVKit 控制条），按键归属按它是否显示来分配：
+    //   · 信息条未显示：AVKit 的控制条处于关闭状态（showsPlaybackControls = false），按键由这里处理——
+    //     ↑/↓ 切换上一条/下一条；OK、←/→、播放键 打开系统信息条（←/→ 同时快退/快进 10s，播放键同时暂停/继续）；
+    //     返回键 退出播放。
+    //   · 信息条显示中：开启 AVKit 控制条，所有按键交给系统，正常操作进度、相关视频、播放暂停等。
+    // 信息条显示/隐藏由 AVPlayerViewControllerDelegate 的 willTransitionToVisibilityOfTransportBar 回调告知，
+    // 隐藏后关闭控制条、把按键收回。
+
+    private var isSystemChromeEnabled = true
+    private var immersiveRecognizers = [UIGestureRecognizer]()
+    private var remoteObserver: RemoteInteractionObserver?
+    private var chromeVisibilityTimer: Timer?
+    private var chromeEnabledAt = Date.distantPast
+    private var chromeEverSeenVisible = false
+    private let seekStep: Double = 10
+
+    private func installFeedFlowRemoteControls() {
+        setSystemChromeEnabled(false)
+        // 首个视频加载期间也先显示封面，避免黑屏
+        if let url = currentPlayInfo.coverURL {
+            loadingCoverView.kf.setImage(with: url)
+            loadingCoverView.alpha = 1
+            startCoverWatch()
+        }
+
+        addImmersivePress(.upArrow, action: #selector(handleUpPress))
+        addImmersivePress(.downArrow, action: #selector(handleDownPress))
+        addImmersivePress(.select, action: #selector(handleSelectPress))
+        addImmersivePress(.leftArrow, action: #selector(handleLeftPress))
+        addImmersivePress(.rightArrow, action: #selector(handleRightPress))
+        addImmersivePress(.playPause, action: #selector(handlePlayPausePress))
+        addImmersivePress(.menu, action: #selector(handleMenuPress))
+    }
+
+    private func addImmersivePress(_ type: UIPress.PressType, action: Selector) {
+        let recognizer = UITapGestureRecognizer(target: self, action: action)
+        recognizer.allowedPressTypes = [NSNumber(value: type.rawValue)]
+        recognizer.delegate = self
+        view.addGestureRecognizer(recognizer)
+        immersiveRecognizers.append(recognizer)
+    }
+
+    private func setSystemChromeEnabled(_ enabled: Bool) {
+        guard isSystemChromeEnabled != enabled else { return }
+        isSystemChromeEnabled = enabled
+        setPlaybackControlsEnabled(enabled)
+        chromeVisibilityTimer?.invalidate()
+        chromeVisibilityTimer = nil
+        pendingChromeRelease = false
+        if enabled {
+            chromeEnabledAt = Date()
+            chromeEverSeenVisible = false
+            chromeVisibilityTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    self?.checkSystemChromeVisibility()
+                }
+            }
+        }
+        Logger.info("[FeedFlow] 系统信息条 \(enabled ? "接管按键" : "收起，↑↓ 切换")")
+    }
+
+    /// 打开系统信息条。AVKit 只在暂停或用户交互时显示控制条；播放中就短暂暂停再续播，让它显示出来
+    private func revealSystemChrome(keepPaused: Bool = false) {
+        setSystemChromeEnabled(true)
+        guard let player = currentPlayer, player.rate > 0 else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak player] in
+            player?.pause()
+            guard !keepPaused else { return }
+            // 暂停只是为了让 AVKit 显示控制条，尽量短，减少画面停顿
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak player] in
+                player?.play()
+            }
         }
     }
 
-    @objc private func handleDoubleDownTap() {
+    /// 系统信息条显示/隐藏的官方回调（动画结束后调用）。隐藏后收回按键，↑↓ 恢复为切换视频。
+    override func transportBarVisibilityWillChange(visible: Bool) {
         guard playMode == .feedFlow else { return }
-        Logger.debug("[FeedFlow] 捕获双击下键，准备切换至下一条")
+        Logger.info("[FeedFlow] 系统信息条\(visible ? "显示" : "隐藏")")
+        if visible {
+            chromeEverSeenVisible = true
+            pendingChromeRelease = false
+        } else if isSystemChromeEnabled {
+            if isFocusOnVideoSurface(UIFocusSystem.focusSystem(for: view)?.focusedItem as? UIView) {
+                setSystemChromeEnabled(false)
+            } else {
+                // 焦点还在相关视频/菜单面板里，等它回到画面再收回按键
+                pendingChromeRelease = true
+            }
+        }
+    }
+
+    private var pendingChromeRelease = false
+
+    private func isFocusOnVideoSurface(_ focused: UIView?) -> Bool {
+        guard let focused else { return true }
+        let name = NSStringFromClass(type(of: focused))
+        return name.contains("AVFocusContainerView") || name.contains("AVPlayerViewControllerContainerView")
+    }
+
+    /// 兜底：打开后 3s 内系统信息条一直没显示出来，就收回按键
+    private func checkSystemChromeVisibility() {
+        guard isSystemChromeEnabled, !chromeEverSeenVisible, presentedViewController == nil else { return }
+        guard Date().timeIntervalSince(chromeEnabledAt) > 3 else { return }
+        Logger.info("[FeedFlow] 系统信息条 3s 未显示，收回按键")
+        setSystemChromeEnabled(false)
+    }
+
+    @objc private func handleSelectPress() {
+        // 暂停状态下按 OK 直接继续播放
+        if let player = currentPlayer, player.rate == 0, player.currentItem != nil {
+            Logger.info("[FeedFlow] OK：继续播放")
+            player.play()
+            return
+        }
+        Logger.info("[FeedFlow] OK：打开系统信息条")
+        revealSystemChrome()
+    }
+
+    @objc private func handlePlayPausePress() {
+        guard let player = currentPlayer else { return }
+        if player.rate > 0 {
+            // 暂停后 AVKit 会自己显示信息条
+            setSystemChromeEnabled(true)
+            player.pause()
+        } else {
+            player.play()
+        }
+    }
+
+    @objc private func handleLeftPress() {
+        seek(by: -seekStep)
+    }
+
+    @objc private func handleRightPress() {
+        seek(by: seekStep)
+    }
+
+    private func seek(by delta: Double) {
+        revealSystemChrome()
+        guard let player = currentPlayer, let item = player.currentItem else { return }
+        let current = item.currentTime().seconds
+        guard current.isFinite else { return }
+        var target = max(0, current + delta)
+        let duration = item.duration.seconds
+        if duration.isFinite, duration > 0 {
+            target = min(target, max(0, duration - 1))
+        }
+        player.seek(to: CMTime(seconds: target, preferredTimescale: 600),
+                    toleranceBefore: CMTime(seconds: 1, preferredTimescale: 600),
+                    toleranceAfter: CMTime(seconds: 1, preferredTimescale: 600))
+    }
+
+    @objc private func handleMenuPress() {
+        dismiss(animated: true)
+    }
+
+    @objc private func handleUpPress() {
+        guard let target = sequenceProvider?.peekPrevious() else { return }
+        Logger.info("[FeedFlow] ↑ 切换至上一条")
+        slideTransition(to: target, direction: .previous)
+        Task { [weak self] in
+            _ = await self?.viewModel.playPreviousFromSequence()
+        }
+    }
+
+    @objc private func handleDownPress() {
+        Logger.info("[FeedFlow] ↓ 切换至下一条")
+        // 下一条可能还没加载到列表里（moveNext 会先拉更多），拿不到时只显示加载封面不做目标预览
+        slideTransition(to: sequenceProvider?.peekNext(), direction: .next)
         Task { [weak self] in
             guard let self else { return }
-            _ = await self.viewModel.playNextFromSequence()
+            if await self.viewModel.playNextFromSequence() == false {
+                self.hideLoadingCover(animated: true)
+            }
+        }
+    }
+
+    // MARK: - 抖音式上下滑动切换 + 封面占位
+
+    //
+    // 视频画面截图在 tvOS 上通常是黑的，所以滑动用封面图：先把当前视频的封面盖上并截图，
+    // 再换成目标视频的封面，旧图滑出、新图滑入；新视频真正开始播放后封面淡出，避免加载期间黑屏。
+
+    private lazy var loadingCoverView: UIImageView = {
+        let imageView = UIImageView()
+        imageView.contentMode = .scaleAspectFit
+        imageView.backgroundColor = .black
+        imageView.isUserInteractionEnabled = false
+        imageView.alpha = 0
+        view.addSubview(imageView)
+        imageView.frame = view.bounds
+        imageView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        return imageView
+    }()
+
+    private weak var activeSlideSnapshot: UIView?
+    private var coverWatchTimer: Timer?
+
+    private func slideTransition(to target: PlayInfo?, direction: AutoTriggeredInfoAction) {
+        // 连续快速切换：结束上一段动画，避免截图叠加、视图停在偏移位置
+        activeSlideSnapshot?.removeFromSuperview()
+        view.layer.removeAllAnimations()
+        view.transform = .identity
+
+        let cover = loadingCoverView
+        view.bringSubviewToFront(cover)
+        if let current = currentPlayInfo.coverURL {
+            cover.kf.setImage(with: current)
+        }
+        cover.alpha = 1
+
+        let snapshot = view.superview.flatMap { container -> UIView? in
+            guard let snap = view.snapshotView(afterScreenUpdates: true) else { return nil }
+            snap.frame = view.frame
+            container.addSubview(snap)
+            return snap
+        }
+        activeSlideSnapshot = snapshot
+
+        cover.image = nil
+        if let url = target?.coverURL {
+            cover.kf.setImage(with: url)
+        }
+        startCoverWatch()
+
+        guard let snapshot else { return }
+        let height = view.bounds.height
+        let offset = direction == .next ? height : -height
+        view.transform = CGAffineTransform(translationX: 0, y: offset)
+        UIView.animate(withDuration: 0.3, delay: 0, options: [.curveEaseOut, .beginFromCurrentState]) {
+            snapshot.transform = CGAffineTransform(translationX: 0, y: -offset)
+            self.view.transform = .identity
+        } completion: { _ in
+            snapshot.removeFromSuperview()
+        }
+    }
+
+    /// 等新视频真正开始播放（且已有画面）后淡出封面；最多等 20s，失败或卡住时由其他恢复逻辑接手。
+    private func startCoverWatch() {
+        coverWatchTimer?.invalidate()
+        let deadline = Date().addingTimeInterval(20)
+        coverWatchTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] timer in
+            MainActor.assumeIsolated {
+                guard let self else {
+                    timer.invalidate()
+                    return
+                }
+                let isPlaying = self.currentPlayer?.timeControlStatus == .playing
+                    && (self.currentPlayer?.currentItem?.status == .readyToPlay)
+                if isPlaying || Date() > deadline {
+                    self.hideLoadingCover(animated: true)
+                }
+            }
+        }
+    }
+
+    private func hideLoadingCover(animated: Bool) {
+        coverWatchTimer?.invalidate()
+        coverWatchTimer = nil
+        guard loadingCoverView.alpha > 0 else { return }
+        UIView.animate(withDuration: animated ? 0.25 : 0) {
+            self.loadingCoverView.alpha = 0
         }
     }
 
@@ -416,12 +697,15 @@ class VideoPlayerViewController: CommonPlayerViewController {
               let context = note.userInfo?[UIFocusSystem.focusUpdateContextUserInfoKey] as? UIFocusUpdateContext,
               let nextView = context.nextFocusedView
         else { return }
+        if pendingChromeRelease, isSystemChromeEnabled, isFocusOnVideoSurface(nextView) {
+            pendingChromeRelease = false
+            setSystemChromeEnabled(false)
+        }
 
         installAVInfoPanelHookIfNeeded(for: nextView)
         #if DEBUG
+            // 不再每次焦点变化都整棵 dump 视图树：主线程开销大，Debug 真机运行时明显拖慢界面
             Logger.debug("[FocusDiag] 焦点落在了类: \(type(of: nextView))")
-            let dumpResult = dumpViewHierarchy(nextView, depth: 0)
-            Logger.debug("[FocusDiag] 子视图结构:\n\(dumpResult)")
         #endif
     }
 
@@ -535,5 +819,40 @@ class VideoPlayerViewController: CommonPlayerViewController {
                 self.pendingAutoTriggeredInfoActionKey = nil
             }
         }
+    }
+}
+
+extension VideoPlayerViewController: UIGestureRecognizerDelegate {
+    func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+        if immersiveRecognizers.contains(where: { $0 === gestureRecognizer }) {
+            // 系统控制条开启时按键全部交还 AVKit
+            return !isSystemChromeEnabled
+        }
+        return true
+    }
+
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+                           shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool
+    {
+        gestureRecognizer === remoteObserver || otherGestureRecognizer === remoteObserver
+    }
+}
+
+/// 只观察、不拦截：在遥控器按键按下时回调（不计触摸板轻触，点按前总会先有触摸），随即失败，不影响任何其他手势与响应者。
+final class RemoteInteractionObserver: UIGestureRecognizer {
+    private let onInteraction: (UIPress.PressType) -> Void
+
+    init(onInteraction: @escaping (UIPress.PressType) -> Void) {
+        self.onInteraction = onInteraction
+        super.init(target: nil, action: nil)
+        cancelsTouchesInView = false
+        delaysTouchesBegan = false
+        delaysTouchesEnded = false
+        allowedTouchTypes = []
+    }
+
+    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent) {
+        presses.forEach { onInteraction($0.type) }
+        state = .failed
     }
 }

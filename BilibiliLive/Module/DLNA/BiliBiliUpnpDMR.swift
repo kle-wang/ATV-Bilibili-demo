@@ -31,6 +31,12 @@ class BiliBiliUpnpDMR: NSObject {
     private var started = false
     private var ip: String?
     private var boardcastTimer: Timer?
+    /// 手机端常连发 Play / PlayUrl，短时间内只执行最后一条，避免多次 dismiss/present 互相打断
+    private var pendingPlayWork: DispatchWorkItem?
+    private var lastPlayKey: String?
+    private var lastPlayAt: Date?
+    private let playDebounce: TimeInterval = 0.3
+    private let duplicatePlayWindow: TimeInterval = 3
 
     private lazy var serverInfo: String = {
         let file = Bundle.main.url(forResource: "DLNAInfo", withExtension: "xml")!
@@ -295,13 +301,46 @@ class BiliBiliUpnpDMR: NSObject {
         }
     }
 
+    /// 在主线程调用（handleEvent 已切到主线程）
     func handlePlay(json: JSON) {
+        pendingPlayWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.performPlay(json: json)
+        }
+        pendingPlayWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + playDebounce, execute: work)
+    }
+
+    private func performPlay(json: JSON) {
+        pendingPlayWork = nil
         let roomId = json["roomId"].stringValue
+        let key = "\(roomId)-\(json["aid"].intValue)-\(json["cid"].intValue)-\(json["epid"].intValue)"
+        if key == lastPlayKey, let lastPlayAt, Date().timeIntervalSince(lastPlayAt) < duplicatePlayWindow {
+            Logger.info("[dlna] 忽略重复投屏指令 \(key)")
+            return
+        }
+        lastPlayKey = key
+        lastPlayAt = Date()
+        Logger.info("[dlna] 执行投屏 \(key)")
+
         if roomId.count > 0, let room = Int(roomId), room > 0 {
             playLive(roomID: room)
         } else {
             playVideo(json: json)
         }
+    }
+
+    /// 等当前转场动画结束再执行，否则 present 会被系统直接忽略
+    private func whenPresentationIdle(attempts: Int = 15, _ block: @escaping () -> Void) {
+        let top = UIViewController.topMostViewController()
+        let busy = top.transitionCoordinator != nil || top.isBeingPresented || top.isBeingDismissed
+        if busy, attempts > 0 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                self?.whenPresentationIdle(attempts: attempts - 1, block)
+            }
+            return
+        }
+        block()
     }
 
     enum PlayStatus: Int {
@@ -346,7 +385,9 @@ extension BiliBiliUpnpDMR {
     func playLive(roomID: Int) {
         let player = LivePlayerViewController()
         player.room = LiveRoom(title: "", room_id: roomID, uname: "", area_v2_name: "", keyframe: nil, face: nil, cover_from_user: nil)
-        UIViewController.topMostViewController().present(player, animated: true)
+        whenPresentationIdle {
+            UIViewController.topMostViewController().present(player, animated: true)
+        }
     }
 
     func playVideo(json: JSON) {
@@ -360,13 +401,17 @@ extension BiliBiliUpnpDMR {
         } else {
             player = VideoDetailViewController.create(aid: aid, cid: cid)
         }
-        let topMost = UIViewController.topMostViewController()
-        if let _ = AppDelegate.shared.window!.rootViewController?.presentedViewController {
-            AppDelegate.shared.window!.rootViewController?.dismiss(animated: false) {
+        whenPresentationIdle { [weak self] in
+            let root = AppDelegate.shared.window?.rootViewController
+            if root?.presentedViewController != nil {
+                root?.dismiss(animated: false) {
+                    self?.whenPresentationIdle {
+                        player.present(from: UIViewController.topMostViewController(), direatlyEnterVideo: true)
+                    }
+                }
+            } else {
                 player.present(from: UIViewController.topMostViewController(), direatlyEnterVideo: true)
             }
-        } else {
-            player.present(from: topMost, direatlyEnterVideo: true)
         }
     }
 }

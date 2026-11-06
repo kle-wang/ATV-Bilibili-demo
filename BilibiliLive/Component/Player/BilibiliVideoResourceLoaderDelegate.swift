@@ -548,15 +548,23 @@ private extension BilibiliVideoResourceLoaderDelegate {
         }
 
         if urlStr.hasPrefix(URLs.customPrefix), let index = Int(customUrl.lastPathComponent) {
-            let playlist = playlists[index]
-            report(loadingRequest, content: playlist)
+            guard playlists.indices.contains(index) else {
+                reportError(loadingRequest, withErrorCode: badRequestErrorCode)
+                return
+            }
+            report(loadingRequest, content: playlists[index])
             return
         }
         if urlStr.hasPrefix(URLs.customDashPrefix), let index = Int(customUrl.lastPathComponent) {
+            guard videoInfo.indices.contains(index) else {
+                reportError(loadingRequest, withErrorCode: badRequestErrorCode)
+                return
+            }
             let info = videoInfo[index]
             Task {
                 report(loadingRequest, content: await getVideoPlayList(info: info))
             }
+            return
         }
         if urlStr.hasPrefix(URLs.customSubtitlePrefix) {
             let url = String(urlStr.dropFirst(URLs.customSubtitlePrefix.count))
@@ -583,7 +591,9 @@ private extension BilibiliVideoResourceLoaderDelegate {
             }
             return
         }
-        Logger.debug("handle loading \(customUrl)")
+        // 未识别的请求必须明确结束，否则 AVPlayer 会一直等待它，表现为卡在加载
+        Logger.warn("unhandled loading request \(customUrl)")
+        reportError(loadingRequest, withErrorCode: badRequestErrorCode)
     }
 
     func bindHttpServer() {

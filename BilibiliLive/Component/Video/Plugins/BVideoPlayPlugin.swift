@@ -80,6 +80,13 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
     private var loadTask: Task<Void, Never>?
     private var loadGeneration = 0
 
+    /// 起播看门狗：AVPlayer 装好资源后若长时间没进入可播放状态，
+    /// 原有的卡顿检测（依赖 playerDidStart / currentTime > 0）都不会触发，表现为无限转圈。
+    private var startupWatchdog: Task<Void, Never>?
+    private var startupRetryCount = 0
+    private let maxStartupRetries = 1
+    private let startupTimeout: TimeInterval = 15
+
     init(playInfo: PlayInfo,
          detailData: PlayerDetailData,
          reportWatchHistory: Bool = true,
@@ -98,6 +105,7 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
 
     deinit {
         networkLogTimer?.invalidate()
+        startupWatchdog?.cancel()
     }
 
     /// 供 DebugPlugin 浮层显示的网络诊断信息
@@ -223,6 +231,10 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
         Logger.info("playback host \(host) observed \(observed)Mbps indicated \(indicated)Mbps effective \(effective)Mbps stalls \(stalls)(+\(stallDelta)) dropped \(dropped)(+\(dropped - lastDroppedFrames)) serverChanges \(event.numberOfServerAddressChanges) tcs \(tcs.rawValue) wait \(waiting) keepUp \(keepUp) buffered \(String(format: "%.1f", buffered))s")
         lastStalls = stalls
         lastDroppedFrames = dropped
+        // 真正播起来后归还起播重试额度，后续切画质/换源卡住时仍可再兜底一次
+        if tcs == .playing {
+            startupRetryCount = 0
+        }
 
         checkStallHealth(stallDelta: stallDelta, buffered: buffered, currentHost: host)
     }
@@ -436,6 +448,7 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
     {
         acceleratedRecoveryAttempts = 0
         acceleratedWaitingSince = nil
+        startupRetryCount = 0
         transportMode = Settings.multiCDNEnabled ? .accelerated : .direct
         let generation = beginLoadGeneration()
         loadTask = Task { @MainActor [weak self] in
@@ -463,6 +476,8 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
     private func beginLoadGeneration() -> Int {
         loadTask?.cancel()
         loadTask = nil
+        startupWatchdog?.cancel()
+        startupWatchdog = nil
         loadGeneration += 1
         return loadGeneration
     }
@@ -470,6 +485,8 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
     private func invalidatePendingLoad(tearingDown: Bool) {
         loadTask?.cancel()
         loadTask = nil
+        startupWatchdog?.cancel()
+        startupWatchdog = nil
         loadGeneration += 1
         playerDelegate = nil
         if tearingDown {
@@ -705,5 +722,76 @@ class BVideoPlayPlugin: NSObject, CommonPlayerPlugin {
             return
         }
         playerVC.player = player
+        armStartupWatchdog(generation: generation)
+    }
+
+    // MARK: - 起播看门狗
+
+    @MainActor
+    private func armStartupWatchdog(generation: Int) {
+        startupWatchdog?.cancel()
+        let timeout = startupTimeout
+        startupWatchdog = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            await self?.handleStartupTimeout(generation: generation)
+        }
+    }
+
+    /// 资源未就绪，或已就绪但一直在等缓冲且几乎没有缓冲数据，视为起播卡死。
+    private func isStuckStarting(player: AVPlayer, item: AVPlayerItem) -> Bool {
+        if item.status != .readyToPlay { return true }
+        return player.timeControlStatus == .waitingToPlayAtSpecifiedRate && bufferedSeconds(of: item) < 1
+    }
+
+    @MainActor
+    private func handleStartupTimeout(generation: Int) async {
+        guard loadGeneration == generation,
+              let player = playerVC?.player,
+              let item = player.currentItem,
+              isStuckStarting(player: player, item: item)
+        else { return }
+
+        let currentHost = playerDelegate?.currentSegmentHost
+        guard startupRetryCount < maxStartupRetries else {
+            Logger.warn("[startup] 起播 \(Int(startupTimeout))s 未就绪且重试已用尽 (host \(currentHost ?? "-"))，放弃")
+            onLoadFailure?("视频加载超时，请检查网络后重试")
+            return
+        }
+        startupRetryCount += 1
+
+        // 换一个与当前不同的 CDN host，并强制直连（加速模式卡死时同样回退直连）
+        let alternateHost = (playerDelegate?.cdnCandidates ?? [])
+            .compactMap { URLComponents(string: $0)?.host }
+            .first { $0 != currentHost }
+        let resumeTime = player.currentTime().seconds
+        Logger.info("[startup] 起播 \(Int(startupTimeout))s 未就绪 (status \(item.status.rawValue), host \(currentHost ?? "-"))，第 \(startupRetryCount) 次重建，改用 \(alternateHost ?? "原地址")")
+
+        let newGeneration = beginLoadGeneration()
+        loadTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try await self.playmedia(urlInfo: self.playData.videoPlayURLInfo,
+                                         playerInfo: self.playData.playerInfo,
+                                         generation: newGeneration,
+                                         maxQuality: self.lastMaxQuality,
+                                         streamIndex: self.lastStreamIndex,
+                                         preferredHost: alternateHost,
+                                         isQualitySwitch: true,
+                                         forceTransport: .direct)
+                if resumeTime.isFinite, resumeTime > 0,
+                   self.loadGeneration == newGeneration,
+                   let newPlayer = self.playerVC?.player
+                {
+                    await newPlayer.seek(to: CMTime(seconds: resumeTime, preferredTimescale: 1), toleranceBefore: .zero, toleranceAfter: .zero)
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                guard self.loadGeneration == newGeneration, self.playerVC != nil else { return }
+                Logger.warn("[startup] 重建失败: \(error)")
+                self.onLoadFailure?(error.localizedDescription)
+            }
+        }
     }
 }

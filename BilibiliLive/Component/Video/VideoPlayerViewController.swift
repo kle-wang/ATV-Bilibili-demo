@@ -284,8 +284,46 @@ class VideoPlayerViewController: CommonPlayerViewController {
             }
         }
 
+        if playMode != .preview {
+            NotificationCenter.default.addObserver(self,
+                                                   selector: #selector(handleAppWillResignActive),
+                                                   name: UIApplication.willResignActiveNotification,
+                                                   object: nil)
+            NotificationCenter.default.addObserver(self,
+                                                   selector: #selector(handleAppDidBecomeActive),
+                                                   name: UIApplication.didBecomeActiveNotification,
+                                                   object: nil)
+        }
+
         viewModel.load()
     }
+
+    // MARK: - 长时间待机后刷新播放地址
+
+    /// 离开超过这个时间回来，认为 CDN 签名地址可能已过期
+    static let staleIdleInterval: TimeInterval = 30 * 60
+    private var resignedActiveAt: Date?
+
+    @objc private func handleAppWillResignActive() {
+        resignedActiveAt = Date()
+    }
+
+    @objc private func handleAppDidBecomeActive() {
+        guard let since = resignedActiveAt else { return }
+        resignedActiveAt = nil
+        let idle = Date().timeIntervalSince(since)
+        guard idle > Self.staleIdleInterval, !isStopping, view.window != nil else { return }
+        Logger.info("[playurl] 待机 \(Int(idle / 60)) 分钟后回来，刷新当前视频地址")
+        let position = currentPlaybackTimeInSeconds()
+        let wasPlaying = (currentPlayer?.rate ?? 0) > 0
+        viewModel.reloadWithFreshURL(resumeAt: position)
+        if !wasPlaying {
+            // 待机前是暂停状态：新播放器就绪后保持暂停，等用户按播放
+            pauseAfterReload = true
+        }
+    }
+
+    private var pauseAfterReload = false
 
     override func viewDidDisappear(_ animated: Bool) {
         let isExiting = isBeingDismissed || isMovingFromParent || navigationController?.isBeingDismissed == true
@@ -306,6 +344,11 @@ class VideoPlayerViewController: CommonPlayerViewController {
     }
 
     override func playerDidStart(player: AVPlayer) {
+        if pauseAfterReload {
+            pauseAfterReload = false
+            player.pause()
+            return
+        }
         switch playMode {
         case .preview:
             onPlaybackStarted?()

@@ -55,7 +55,11 @@ actor PlayContextCache {
         let task: Task<PlayContextSnapshot, Error>
     }
 
+    /// B 站播放地址（CDN 签名）有时效，缓存超过这个时间就重新获取，避免长时间待机后拿到失效地址
+    static let maxSnapshotAge: TimeInterval = 30 * 60
+
     private let maxEntries = 12
+    private var fetchedAt = [PlayContextEntryKey: Date]()
     private let recentEntriesToKeep = 4
     private var entries = [PlayContextEntryKey: PlayContextSnapshot]()
     private var inFlightTasks = [PlayContextEntryKey: InFlightEntry]()
@@ -68,6 +72,13 @@ actor PlayContextCache {
     func context(for playInfo: PlayInfo, mode: PlayContextMode) async throws -> PlayContextSnapshot {
         let resolvedPlayInfo = try await PlayInfoResolver.resolve(playInfo)
         let entryKey = PlayContextEntryKey(contextKey: resolvedPlayInfo.contextKey, mode: mode)
+
+        if let date = fetchedAt[entryKey], Date().timeIntervalSince(date) > Self.maxSnapshotAge {
+            Logger.info("[playurl] 缓存地址已超过 \(Int(Self.maxSnapshotAge / 60)) 分钟，重新获取 av\(resolvedPlayInfo.aid)")
+            entries[entryKey] = nil
+            fetchedAt[entryKey] = nil
+            accessOrder.removeAll { $0 == entryKey }
+        }
 
         if var cached = entries[entryKey] {
             touch(entryKey)
@@ -134,6 +145,7 @@ actor PlayContextCache {
             inFlightTasks[key] = nil
         }
         entries = entries.filter { entryKeysToKeep.contains($0.key) }
+        fetchedAt = fetchedAt.filter { entryKeysToKeep.contains($0.key) }
         accessOrder.removeAll { !entryKeysToKeep.contains($0) }
     }
 
@@ -145,6 +157,7 @@ actor PlayContextCache {
             }
             inFlightTasks[key] = nil
             entries[key] = snapshot
+            fetchedAt[key] = Date()
             touch(key)
             trimToMaxEntryCount()
             return snapshot
@@ -168,6 +181,25 @@ actor PlayContextCache {
             removableKeys.removeFirst()
             accessOrder.removeAll { $0 == key }
             entries[key] = nil
+            fetchedAt[key] = nil
         }
+    }
+
+    /// 丢弃某个视频的缓存地址（播放失败重试、长时间待机后恢复时使用）
+    func invalidate(playInfo: PlayInfo) {
+        let keys = entries.keys.filter { $0.contextKey.aid == playInfo.aid && (playInfo.cid ?? 0 == 0 || $0.contextKey.cid == playInfo.cid) }
+        for key in keys {
+            entries[key] = nil
+            fetchedAt[key] = nil
+            accessOrder.removeAll { $0 == key }
+        }
+    }
+
+    func removeAll() {
+        inFlightTasks.values.forEach { $0.task.cancel() }
+        inFlightTasks.removeAll()
+        entries.removeAll()
+        fetchedAt.removeAll()
+        accessOrder.removeAll()
     }
 }

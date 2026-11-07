@@ -123,6 +123,9 @@ actor PlayerMediaWarmupManager {
     private let maxPreparedEntries = 6
     private let playContextCache: PlayContextCache
     private var prepared = [String: PreparedPlayerMedia]()
+    private var preparedAt = [String: Date]()
+    /// 预热资源里的分片地址同样有时效，超过就丢弃重建
+    private let maxPreparedAge: TimeInterval = 20 * 60
     private var inFlight = [String: InFlightEntry]()
     private var accessOrder = [String]()
     private var cancellationGeneration = 0
@@ -166,6 +169,13 @@ actor PlayerMediaWarmupManager {
         // 开关只影响新建会话，已准备的旧模式资产保持原生命周期。
         let transportSnapshot: MediaTransportMode = Settings.multiCDNEnabled ? .accelerated : .direct
         let key = resolvedPlayInfo.sequenceKey + "#" + transportCacheKey(for: transportSnapshot)
+        if let cached = prepared[key], let date = preparedAt[key], Date().timeIntervalSince(date) > maxPreparedAge {
+            Logger.info("[prebuffer] 预热资源已过期，重新准备 av\(resolvedPlayInfo.aid)")
+            prepared[key] = nil
+            preparedAt[key] = nil
+            accessOrder.removeAll { $0 == key }
+            discard([cached])
+        }
         if let cached = prepared[key] {
             touch(key)
             return (key, cached)
@@ -206,6 +216,7 @@ actor PlayerMediaWarmupManager {
             }
             inFlight[key] = nil
             prepared[key] = media
+            preparedAt[key] = Date()
             touch(key)
             trimToCapacity()
             return media
@@ -223,6 +234,7 @@ actor PlayerMediaWarmupManager {
         inFlight.removeAll()
         discard(Array(prepared.values))
         prepared.removeAll()
+        preparedAt.removeAll()
         accessOrder.removeAll()
     }
 

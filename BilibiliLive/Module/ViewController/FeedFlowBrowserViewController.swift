@@ -189,15 +189,37 @@ class FeedFlowBrowserViewController: UIViewController, BLTabBarContentVCProtocol
         resumePreviewIfNeeded()
     }
 
+    private var resignedActiveAt: Date?
+
     @objc private func handleAppWillResignActive() {
+        resignedActiveAt = Date()
         guard isViewLoaded, view.window != nil else { return }
         suspendPreview(cancelWarmups: true)
     }
 
     @objc private func handleAppDidBecomeActive() {
-        guard isViewLoaded, view.window != nil else { return }
-        guard !autoReloadIfNeeded() else { return }
-        resumePreviewIfNeeded()
+        let idle = resignedActiveAt.map { Date().timeIntervalSince($0) } ?? 0
+        resignedActiveAt = nil
+        guard idle > VideoPlayerViewController.staleIdleInterval else {
+            guard isViewLoaded, view.window != nil else { return }
+            guard !autoReloadIfNeeded() else { return }
+            resumePreviewIfNeeded()
+            return
+        }
+        // 长时间待机后只刷新会过期的 CDN 播放地址：清掉地址缓存和预热资源，列表内容与位置保持不变。
+        // 预览要等缓存清完再开始，否则可能又拿到旧地址。
+        // 播放页在前面时由它自己原位换新地址；这里清缓存会取消它正在进行的请求，交给缓存过期机制兜底
+        guard presentedViewController == nil else { return }
+        Logger.info("[playurl] 沉浸式列表待机 \(Int(idle / 60)) 分钟，刷新播放地址（列表不变）")
+        Task { [weak self, playContextCache, mediaWarmupManager] in
+            await playContextCache.removeAll()
+            await mediaWarmupManager.cancelAll()
+            await MainActor.run {
+                guard let self, self.isViewLoaded, self.view.window != nil else { return }
+                guard !self.autoReloadIfNeeded() else { return }
+                self.resumePreviewIfNeeded()
+            }
+        }
     }
 
     func reloadData() {

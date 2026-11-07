@@ -280,7 +280,26 @@ class VideoPlayerViewModel {
     }
 
     func retryCurrent() {
-        load()
+        // 失败多半是地址失效或节点异常，重试时不能再用缓存里的旧地址
+        Task { [weak self] in
+            guard let self else { return }
+            await self.playContextCache?.invalidate(playInfo: self.playInfo)
+            self.load()
+        }
+    }
+
+    /// 长时间待机（播放地址可能已过期）后恢复：丢弃缓存地址，从当前进度用新地址重新加载
+    func reloadWithFreshURL(resumeAt seconds: Int?) {
+        if let seconds, seconds >= 1 {
+            resumePositions[Self.resumeKey(aid: playInfo.aid, cid: playInfo.cid)] = seconds
+        }
+        Logger.info("[playurl] 待机后重新获取播放地址 av\(playInfo.aid)，从 \(seconds ?? 0)s 继续")
+        Task { [weak self] in
+            guard let self else { return }
+            await self.playContextCache?.invalidate(playInfo: self.playInfo)
+            await self.mediaWarmupManager?.cancelAll()
+            self.load()
+        }
     }
 
     func playNextFromSequence() async -> Bool {

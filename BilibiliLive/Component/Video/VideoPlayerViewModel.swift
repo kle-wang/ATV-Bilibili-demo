@@ -19,7 +19,9 @@ struct PlayerDetailData {
     var detail: VideoDetail?
     var clips: [VideoPlayURLInfo.ClipInfo]?
     var playerInfo: PlayerInfo?
-    var videoPlayURLInfo: VideoPlayURLInfo
+    let source: PlaybackSource
+
+    var videoPlayURLInfo: VideoPlayURLInfo { source.info }
 
     var isBangumi: Bool {
         return epid ?? 0 > 0 || seasonId ?? 0 > 0
@@ -32,6 +34,7 @@ class VideoPlayerViewModel {
     var onExit: (() -> Void)?
     var onPlayInfoChanged: ((PlayInfo) -> Void)?
     var onShowDetail: ((PlayInfo) -> Void)?
+    var onPlaybackFailure: ((String, BVideoPlayPlugin) -> Void)?
     var sequenceProvider: VideoSequenceProvider?
 
     private var playInfo: PlayInfo
@@ -126,7 +129,8 @@ class VideoPlayerViewModel {
             cancellable.removeAll()
             let plugins = generatePlayerPlugin(data,
                                                playInfo: resolvedPlayInfo,
-                                               danmuProvider: danmuProvider)
+                                               danmuProvider: danmuProvider,
+                                               generation: generation)
             guard !Task.isCancelled, loadGeneration == generation else { return }
             loadResult.send(.success(plugins))
         } catch is CancellationError {
@@ -165,12 +169,12 @@ class VideoPlayerViewModel {
                                           detail: resolvedDetail,
                                           clips: nil,
                                           playerInfo: cached.playerInfo,
-                                          videoPlayURLInfo: cached.videoPlayURLInfo)
+                                          source: cached.source)
 
             let lastPlayCid = playInfo.lastPlayCid ?? cached.playerInfo?.last_play_cid ?? 0
             let playTimeInSecond = playInfo.playTimeInSecond ?? cached.playerInfo?.playTimeInSecond ?? 0
             detail.playerStartPos = resolvedPlayerStartPos(cid: cached.cid,
-                                                           duration: cached.videoPlayURLInfo.dash.duration,
+                                                           duration: cached.source.info.dash.duration,
                                                            lastPlayCid: lastPlayCid,
                                                            playTimeInSecond: playTimeInSecond,
                                                            playInfo: playInfo)
@@ -182,32 +186,13 @@ class VideoPlayerViewModel {
         async let infoReq = try? WebRequest.requestPlayerInfo(aid: aid, cid: cid)
         async let detailReq = fetchVideoDetail(aid: aid, existing: existingVideoDetail)
         do {
-            let playData: VideoPlayURLInfo
-            var clipInfos: [VideoPlayURLInfo.ClipInfo]?
-
-            if playInfo.isBangumi {
-                do {
-                    playData = try await WebRequest.requestPcgPlayUrl(aid: aid, cid: cid, options: playContextMode.requestOptions)
-                } catch let err as RequestError {
-                    if case let .statusFail(code, _) = err,
-                       code == -404 || code == -10403,
-                       let data = try await fetchAreaLimitPcgVideoData(for: playInfo)
-                    {
-                        playData = data
-                    } else {
-                        throw err
-                    }
-                }
-
-                clipInfos = playData.clip_info_list
-            } else {
-                playData = try await WebRequest.requestPlayUrl(aid: aid, cid: cid, options: playContextMode.requestOptions)
-            }
+            let source = try await requestPlaybackSource(for: playInfo)
+            let playData = source.info
 
             let info = await infoReq
             let resolvedDetail = await detailReq
 
-            var detail = PlayerDetailData(aid: playInfo.aid, cid: playInfo.cid!, epid: playInfo.epid, seasonId: playInfo.seasonId, subType: playInfo.subType, detail: resolvedDetail, clips: clipInfos, playerInfo: info, videoPlayURLInfo: playData)
+            var detail = PlayerDetailData(aid: aid, cid: cid, epid: playInfo.epid, seasonId: playInfo.seasonId, subType: playInfo.subType, detail: resolvedDetail, clips: playInfo.isBangumi ? playData.clip_info_list : nil, playerInfo: info, source: source)
 
             let last_play_cid = playInfo.lastPlayCid ?? info?.last_play_cid ?? 0
             let playTimeInSecond = playInfo.playTimeInSecond ?? info?.playTimeInSecond ?? 0
@@ -228,6 +213,27 @@ class VideoPlayerViewModel {
                 throw err
             }
         }
+    }
+
+    private func requestPlaybackSource(for playInfo: PlayInfo) async throws -> PlaybackSource {
+        let aid = playInfo.aid
+        let cid = playInfo.cid ?? 0
+        let start = ProcessInfo.processInfo.systemUptime
+        let info: VideoPlayURLInfo
+        if playInfo.isBangumi {
+            do {
+                info = try await WebRequest.requestPcgPlayUrl(aid: aid, cid: cid, options: playContextMode.requestOptions)
+            } catch let error as RequestError {
+                guard case let .statusFail(code, _) = error, code == -404 || code == -10403,
+                      let regional = try await fetchAreaLimitPcgVideoData(for: playInfo)
+                else { throw error }
+                info = regional
+            }
+        } else {
+            info = try await WebRequest.requestPlayUrl(aid: aid, cid: cid, options: playContextMode.requestOptions)
+        }
+        Logger.info("[playurl] av\(aid) 取流 \(Int((ProcessInfo.processInfo.systemUptime - start) * 1000))ms")
+        return PlaybackSource(info: info)
     }
 
     /// 由播放器提供当前播放秒数，切换视频前用于记录进度
@@ -280,25 +286,13 @@ class VideoPlayerViewModel {
     }
 
     func retryCurrent() {
-        // 失败多半是地址失效或节点异常，重试时不能再用缓存里的旧地址
+        let requested = playInfo
+        let generation = loadGeneration
         Task { [weak self] in
             guard let self else { return }
-            await self.playContextCache?.invalidate(playInfo: self.playInfo)
-            self.load()
-        }
-    }
-
-    /// 长时间待机（播放地址可能已过期）后恢复：丢弃缓存地址，从当前进度用新地址重新加载
-    func reloadWithFreshURL(resumeAt seconds: Int?) {
-        if let seconds, seconds >= 1 {
-            resumePositions[Self.resumeKey(aid: playInfo.aid, cid: playInfo.cid)] = seconds
-        }
-        Logger.info("[playurl] 待机后重新获取播放地址 av\(playInfo.aid)，从 \(seconds ?? 0)s 继续")
-        Task { [weak self] in
-            guard let self else { return }
-            await self.playContextCache?.invalidate(playInfo: self.playInfo)
-            await self.mediaWarmupManager?.cancelAll()
-            self.load()
+            await playContextCache?.invalidate(playInfo: requested)
+            guard loadGeneration == generation else { return }
+            startLoad(for: requested)
         }
     }
 
@@ -324,58 +318,32 @@ class VideoPlayerViewModel {
         updatePlayInfo(temporaryPlayInfo)
     }
 
-    /// 沉浸式模式提前缓冲的条数和每条缓冲时长
-    static let feedFlowPrebufferCount = 4
-    static let feedFlowPrebufferSeconds: Double = 15
-
-    func preloadNeighborsIfNeeded() async {
-        guard playMode == .feedFlow, let playContextCache, let sequenceProvider else { return }
-        let current = sequenceProvider.current() ?? currentPlayInfo
-        let upcoming = sequenceProvider.peekNext(count: Self.feedFlowPrebufferCount)
-        let previous = sequenceProvider.peekPrevious()
-        let keep = ([current] + upcoming + [previous].compactMap { $0 }).uniqued()
-        for info in keep {
-            guard !Task.isCancelled else { return }
-            await playContextCache.preload(playInfo: info, mode: .regular)
-        }
-        guard !Task.isCancelled else { return }
-        await playContextCache.trim(keeping: keep)
-        // 当前条已由播放器取走，不再为它重复准备资源；先把下一条、上一条的资源备好，保证切换秒开
-        let warmups = ([upcoming.first, previous].compactMap { $0 }).filter { $0.sequenceKey != current.sequenceKey }.uniqued()
-        for info in warmups {
-            guard !Task.isCancelled else { return }
-            await mediaWarmupManager?.preload(playInfo: info)
-        }
-    }
-
-    /// 逐条为后面几条视频缓冲开头若干秒。由播放器在当前视频缓冲充足后调用，避免和当前视频抢带宽。
-    func prebufferUpcoming() async {
-        guard playMode == .feedFlow, let sequenceProvider, let mediaWarmupManager else { return }
-        let current = sequenceProvider.current() ?? currentPlayInfo
-        let upcoming = sequenceProvider.peekNext(count: Self.feedFlowPrebufferCount)
-            .filter { $0.sequenceKey != current.sequenceKey }
-        for info in upcoming {
-            guard !Task.isCancelled else { return }
-            await playContextCache?.preload(playInfo: info, mode: .regular)
-            guard !Task.isCancelled else { return }
-            await mediaWarmupManager.prebuffer(playInfo: info,
-                                               seconds: Self.feedFlowPrebufferSeconds,
-                                               timeout: 30)
-        }
+    func prebufferNext(shouldContinue: @escaping @MainActor @Sendable () -> Bool) async {
+        guard playMode == .feedFlow, let next = sequenceProvider?.peekNext() else { return }
+        await mediaWarmupManager?.prebuffer(playInfo: next, shouldContinue: shouldContinue)
     }
 
     private func generatePlayerPlugin(_ data: PlayerDetailData,
                                       playInfo: PlayInfo,
-                                      danmuProvider: VideoDanmuProvider) -> [CommonPlayerPlugin]
+                                      danmuProvider: VideoDanmuProvider,
+                                      generation: Int) -> [CommonPlayerPlugin]
     {
         let playplugin = BVideoPlayPlugin(playInfo: playInfo,
                                           detailData: data,
                                           reportWatchHistory: playMode != .preview,
                                           minimizeStalling: true,
                                           isMuted: playMode == .preview && previewMuted,
-                                          mediaWarmupManager: playMode == .feedFlow ? mediaWarmupManager : nil)
-        playplugin.onLoadFailure = { [weak self] message in
-            self?.loadResult.send(.failure(message))
+                                          mediaWarmupManager: playMode == .feedFlow ? mediaWarmupManager : nil,
+                                          refreshSource: { [weak self] sourceID in
+                                              guard let self, loadGeneration == generation else { throw CancellationError() }
+                                              if !playInfo.isBangumi, let playContextCache {
+                                                  return try await playContextCache.context(for: playInfo, mode: playContextMode, replacing: sourceID).source
+                                              }
+                                              return try await requestPlaybackSource(for: playInfo)
+                                          })
+        playplugin.onLoadFailure = { [weak self, weak playplugin] message in
+            guard let self, let playplugin, loadGeneration == generation else { return }
+            onPlaybackFailure?(message, playplugin)
         }
 
         if playMode == .preview {

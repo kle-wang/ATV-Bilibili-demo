@@ -85,6 +85,27 @@ enum ParsedMediaRange: Equatable, Sendable {
 }
 
 enum MediaRangeParsing {
+    static func validatePartialResponse(_ response: URLResponse,
+                                        requested: MediaByteRange,
+                                        allowShortEOF: Bool = false) throws -> (range: MediaByteRange, total: Int64?)
+    {
+        guard let http = response as? HTTPURLResponse else { throw MediaRangeError.upstream(status: -1) }
+        guard http.statusCode == 206 else { throw MediaRangeError.upstream(status: http.statusCode) }
+        guard let header = http.value(forHTTPHeaderField: "Content-Range"),
+              let parsed = parseContentRange(header), parsed.range.start == requested.start
+        else { throw MediaRangeError.mismatch }
+
+        if let total = parsed.total, parsed.range.end >= total {
+            throw MediaRangeError.unsatisfiable(total: total)
+        }
+        if parsed.range.end != requested.end {
+            guard allowShortEOF, let total = parsed.total,
+                  parsed.range.end == total - 1, parsed.range.end < requested.end
+            else { throw MediaRangeError.mismatch }
+        }
+        return parsed
+    }
+
     /// 解析 HTTP Range 请求头。
     /// - Parameters:
     ///   - header: request.headers["range"]（已小写 key，值大小写不敏感）

@@ -188,10 +188,10 @@ class VideoPlayerViewController: CommonPlayerViewController {
     var onDismissWithPlayInfo: ((PlayInfo) -> Void)?
 
     private let playMode: VideoPlayerMode
-    private let playContextCache: PlayContextCache?
     private let mediaWarmupManager: PlayerMediaWarmupManager?
-    private let previewMuted: Bool
     private let viewModel: VideoPlayerViewModel
+    private weak var playbackPlugin: BVideoPlayPlugin?
+    private weak var prebufferingForItem: AVPlayerItem?
     private var cancelable = Set<AnyCancellable>()
     private var neighborPreloadTask: Task<Void, Never>?
     private var currentRetryKey: String
@@ -207,9 +207,7 @@ class VideoPlayerViewController: CommonPlayerViewController {
          startTimeOverride: Int? = nil)
     {
         self.playMode = playMode
-        self.playContextCache = playContextCache
         self.mediaWarmupManager = mediaWarmupManager
-        self.previewMuted = previewMuted
         viewModel = VideoPlayerViewModel(playInfo: playInfo,
                                          playMode: playMode,
                                          playContextCache: playContextCache,
@@ -245,21 +243,33 @@ class VideoPlayerViewController: CommonPlayerViewController {
         viewModel.onShowDetail = { [weak self] info in
             self?.showDetail(for: info)
         }
+        viewModel.onPlaybackFailure = { [weak self] message, plugin in
+            guard let self, !isStopping, playbackPlugin === plugin else { return }
+            if playMode == .feedFlow {
+                showFeedFlowRecoveryAlert(message: message, retry: { [weak plugin] in plugin?.retry() })
+            } else {
+                handleLoadFailure(message: message)
+            }
+        }
         viewModel.loadResult.receive(on: DispatchQueue.main).sink { [weak self] result in
+            guard let self, !self.isStopping else { return }
             switch result {
             case let .failure(err):
-                self?.handleLoadFailure(message: err)
+                self.handleLoadFailure(message: err)
             case let .success(plugins):
-                self?.neighborPreloadTask?.cancel()
-                self?.removeAllPlugins()
-                plugins.forEach { self?.addPlugin(plugin: $0) }
-                self?.neighborPreloadTask = Task { [weak self] in
-                    await self?.viewModel.preloadNeighborsIfNeeded()
-                    // 当前视频先缓冲够，再逐条预缓冲后面几条，避免抢当前视频的带宽
-                    guard self?.playMode == .feedFlow else { return }
-                    guard await self?.waitForCurrentPlaybackBuffered() == true else { return }
-                    await self?.viewModel.prebufferUpcoming()
+                self.cancelNeighborPrebuffer()
+                self.removeAllPlugins()
+                self.playbackPlugin = plugins.compactMap { $0 as? BVideoPlayPlugin }.first
+                self.playbackPlugin?.onFirstFrame = { [weak self] in
+                    guard let self else { return }
+                    if self.playMode == .preview {
+                        self.onPlaybackStarted?()
+                    } else if self.playMode == .feedFlow {
+                        self.hideLoadingCover(animated: true)
+                        self.startNeighborPrebuffer()
+                    }
                 }
+                plugins.forEach { self.addPlugin(plugin: $0) }
             }
         }.store(in: &cancelable)
 
@@ -271,6 +281,10 @@ class VideoPlayerViewController: CommonPlayerViewController {
 
         if playMode == .feedFlow {
             installFeedFlowRemoteControls()
+            NotificationCenter.default.addObserver(self,
+                                                   selector: #selector(handlePlaybackTimeJumped(_:)),
+                                                   name: .AVPlayerItemTimeJumped,
+                                                   object: nil)
 
             NotificationCenter.default.addObserver(self,
                                                    selector: #selector(handleInfoActionFocusedNotification(_:)),
@@ -298,32 +312,16 @@ class VideoPlayerViewController: CommonPlayerViewController {
         viewModel.load()
     }
 
-    // MARK: - 长时间待机后刷新播放地址
-
-    /// 离开超过这个时间回来，认为 CDN 签名地址可能已过期
-    static let staleIdleInterval: TimeInterval = 30 * 60
-    private var resignedActiveAt: Date?
-
     @objc private func handleAppWillResignActive() {
-        resignedActiveAt = Date()
+        guard !isStopping, view.window != nil else { return }
+        playbackPlugin?.suspendRecovery()
+        cancelNeighborPrebuffer()
     }
 
     @objc private func handleAppDidBecomeActive() {
-        guard let since = resignedActiveAt else { return }
-        resignedActiveAt = nil
-        let idle = Date().timeIntervalSince(since)
-        guard idle > Self.staleIdleInterval, !isStopping, view.window != nil else { return }
-        Logger.info("[playurl] 待机 \(Int(idle / 60)) 分钟后回来，刷新当前视频地址")
-        let position = currentPlaybackTimeInSeconds()
-        let wasPlaying = (currentPlayer?.rate ?? 0) > 0
-        viewModel.reloadWithFreshURL(resumeAt: position)
-        if !wasPlaying {
-            // 待机前是暂停状态：新播放器就绪后保持暂停，等用户按播放
-            pauseAfterReload = true
-        }
+        guard !isStopping, view.window != nil else { return }
+        playbackPlugin?.resumeAfterSuspension()
     }
-
-    private var pauseAfterReload = false
 
     override func viewDidDisappear(_ animated: Bool) {
         let isExiting = isBeingDismissed || isMovingFromParent || navigationController?.isBeingDismissed == true
@@ -343,36 +341,12 @@ class VideoPlayerViewController: CommonPlayerViewController {
         super.stopPlayback()
     }
 
-    override func playerDidStart(player: AVPlayer) {
-        if pauseAfterReload {
-            pauseAfterReload = false
-            player.pause()
-            return
-        }
-        switch playMode {
-        case .preview:
-            onPlaybackStarted?()
-        case .feedFlow, .regular:
-            break
-        }
-    }
-
     override func playerDidStall(player: AVPlayer) {
-        // 卡顿由 BVideoPlayPlugin 原位恢复（保留播放进度）；这里不再整条重载，
-        // 否则短暂缓冲见底就会让视频从头开始播放。
-    }
-
-    override func playerDidFail(player: AVPlayer) {
-        guard playMode == .feedFlow else {
-            super.playerDidFail(player: player)
-            return
-        }
-        attemptRetryOrShowRecovery(message: "当前视频加载失败，请选择重试或切换下一条。")
+        cancelNeighborPrebuffer()
     }
 
     private func handlePlayInfoChanged(_ info: PlayInfo) {
-        neighborPreloadTask?.cancel()
-        neighborPreloadTask = nil
+        cancelNeighborPrebuffer()
         if currentRetryKey != info.sequenceKey {
             currentRetryKey = info.sequenceKey
             hasRetriedCurrentItem = false
@@ -388,8 +362,7 @@ class VideoPlayerViewController: CommonPlayerViewController {
         chromeVisibilityTimer = nil
         coverWatchTimer?.invalidate()
         coverWatchTimer = nil
-        neighborPreloadTask?.cancel()
-        neighborPreloadTask = nil
+        cancelNeighborPrebuffer()
         viewModel.cancelLoading()
         cancelable.removeAll()
         Task { [mediaWarmupManager] in
@@ -417,11 +390,12 @@ class VideoPlayerViewController: CommonPlayerViewController {
         viewModel.retryCurrent()
     }
 
-    private func showFeedFlowRecoveryAlert(message: String) {
+    private func showFeedFlowRecoveryAlert(message: String, retry: (() -> Void)? = nil) {
+        guard presentedViewController == nil else { return }
         let alert = UIAlertController(title: "播放异常", message: message, preferredStyle: .alert)
         alert.addAction(UIAlertAction(title: "重试", style: .default) { [weak self] _ in
             self?.hasRetriedCurrentItem = true
-            self?.viewModel.retryCurrent()
+            if let retry { retry() } else { self?.viewModel.retryCurrent() }
         })
         alert.addAction(UIAlertAction(title: "下一条", style: .default) { [weak self] _ in
             Task { [weak self] in
@@ -445,24 +419,37 @@ class VideoPlayerViewController: CommonPlayerViewController {
         detailVC.present(from: self, direatlyEnterVideo: false)
     }
 
-    /// 等当前视频缓冲到 4s 以上（或已播放 20s 仍不足时放弃）。返回 false 表示被取消或条件不满足。
-    private func waitForCurrentPlaybackBuffered() async -> Bool {
-        let start = ProcessInfo.processInfo.systemUptime
-        while !Task.isCancelled {
-            if let item = currentPlayer?.currentItem,
-               item.status == .readyToPlay,
-               let range = item.loadedTimeRanges.first?.timeRangeValue
-            {
-                let buffered = range.start.seconds + range.duration.seconds - item.currentTime().seconds
-                if buffered.isFinite, buffered >= 4 { return true }
+    private func startNeighborPrebuffer() {
+        guard let item = currentPlayer?.currentItem, !isStopping else { return }
+        cancelNeighborPrebuffer()
+        neighborPreloadTask = Task { [weak self, weak item] in
+            let deadline = ProcessInfo.processInfo.systemUptime + 15
+            while !Task.isCancelled, ProcessInfo.processInfo.systemUptime < deadline {
+                guard let self, let item, currentPlayer?.currentItem === item,
+                      currentPlayer?.timeControlStatus == .playing
+                else { return }
+                if item.forwardBufferedSeconds() >= 5 {
+                    prebufferingForItem = item
+                    await viewModel.prebufferNext { [weak self, weak item] in
+                        guard let self, let item, self.currentPlayer?.currentItem === item else { return false }
+                        return self.currentPlayer?.timeControlStatus == .playing && item.forwardBufferedSeconds() >= 3
+                    }
+                    return
+                }
+                try? await Task.sleep(nanoseconds: 500_000_000)
             }
-            if ProcessInfo.processInfo.systemUptime - start > 20 {
-                Logger.info("[prebuffer] 当前视频 20s 内未缓冲到 4s，跳过预缓冲")
-                return false
-            }
-            try? await Task.sleep(nanoseconds: 1_000_000_000)
         }
-        return false
+    }
+
+    private func cancelNeighborPrebuffer() {
+        neighborPreloadTask?.cancel()
+        neighborPreloadTask = nil
+        prebufferingForItem = nil
+    }
+
+    @objc private func handlePlaybackTimeJumped(_ notification: Notification) {
+        guard let item = notification.object as? AVPlayerItem, prebufferingForItem === item else { return }
+        cancelNeighborPrebuffer()
     }
 
     // MARK: - 沉浸式模式遥控器
@@ -607,7 +594,6 @@ class VideoPlayerViewController: CommonPlayerViewController {
     }
 
     private func seek(by delta: Double) {
-        revealSystemChrome()
         guard let player = currentPlayer, let item = player.currentItem else { return }
         let current = item.currentTime().seconds
         guard current.isFinite else { return }
@@ -616,6 +602,9 @@ class VideoPlayerViewController: CommonPlayerViewController {
         if duration.isFinite, duration > 0 {
             target = min(target, max(0, duration - 1))
         }
+        cancelNeighborPrebuffer()
+        revealSystemChrome()
+        if playbackPlugin?.renewBeforeSeek(to: target) == true { return }
         player.seek(to: CMTime(seconds: target, preferredTimescale: 600),
                     toleranceBefore: CMTime(seconds: 1, preferredTimescale: 600),
                     toleranceAfter: CMTime(seconds: 1, preferredTimescale: 600))

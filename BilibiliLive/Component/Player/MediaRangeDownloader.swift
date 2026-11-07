@@ -249,6 +249,7 @@ actor MediaRangeDownloader {
     private let equivalenceSampleBytes: Int64 = 32 * 1024
 
     private let candidates: [String]
+    private let deadlines: [String: Date]
     private let referer: String
     private let userAgent: String
     private let mode: MediaTransportMode
@@ -282,6 +283,7 @@ actor MediaRangeDownloader {
 
     init(candidates: [String], referer: String, userAgent: String = Keys.userAgent, mode: MediaTransportMode = .accelerated) {
         self.candidates = candidates
+        deadlines = candidates.reduce(into: [:]) { $0[$1] = PlaybackSource.deadline(for: $1) }
         self.referer = referer
         self.userAgent = userAgent
         self.mode = mode
@@ -613,7 +615,7 @@ actor MediaRangeDownloader {
         // candidateHosts 由调用方按轮转/统计排好序，原样采用，不再二次排序，
         // 保证初始分配即分散；nil 时回退到当前统计排序。
         let hosts = candidateHosts ?? orderedHosts()
-        guard !hosts.isEmpty else { throw MediaRangeError.unsatisfiable(total: knownTotalLength) }
+        guard !hosts.isEmpty else { throw PlaybackSourceError.expired }
         if !allowHedging || hosts.count == 1 || subrange.length < subrangeMinBytes {
             // 单路：无竞速，交付前仍需过等价性门控（单 host/代理模式内直接通过）。
             let (data, host) = try await fetchSubrangeWithRetry(subrange, hosts: hosts)
@@ -764,7 +766,8 @@ actor MediaRangeDownloader {
     }
 
     private func fetchSubrangeWithRetry(_ subrange: MediaByteRange, hosts: [String]) async throws -> (data: Data, host: String) {
-        var lastError: Error = MediaRangeError.unsatisfiable(total: knownTotalLength)
+        var lastError: Error = PlaybackSourceError.expired
+        var rejectedStatus: Int?
         let attempts = min(hosts.count, maxRetriesPerSubrange + 1)
         for attempt in 0..<attempts {
             try Task.checkCancellation()
@@ -777,10 +780,14 @@ actor MediaRangeDownloader {
                 throw CancellationError()
             } catch {
                 lastError = error
+                if case let .upstream(status) = error as? MediaRangeError, PlaybackSourceError.rejectionStatus(status) {
+                    rejectedStatus = status
+                }
                 // 取消不计入 CDN 健康失败（由上层区分）
                 continue
             }
         }
+        if let rejectedStatus { throw MediaRangeError.upstream(status: rejectedStatus) }
         throw lastError
     }
 
@@ -891,18 +898,17 @@ actor MediaRangeDownloader {
         // 同一媒体流内可交换的 CDN 候选：host 匹配的第一个 URL。
         // 字节一致性由等价性采样（verifyHostEquivalence）与重叠比较强制保证，
         // 未验证的 host 不得参与拼接，而非默认信任。
-        for url in candidates {
-            if URLComponents(string: url)?.host == host {
-                return url
-            }
+        let now = Date()
+        return candidates.first {
+            (deadlines[$0] ?? .distantFuture) > now && URLComponents(string: $0)?.host == host
         }
-        return candidates.first
     }
 
     private func orderedHosts() -> [String] {
         var seen = Set<String>()
         var hosts = [String]()
-        for url in candidates {
+        let now = Date()
+        for url in candidates where (deadlines[url] ?? .distantFuture) > now {
             guard let host = URLComponents(string: url)?.host else { continue }
             if seen.insert(host).inserted {
                 hosts.append(host)
@@ -969,11 +975,14 @@ actor MediaRangeDownloader {
         }
 
         let session = ensureSession()
-        var request = URLRequest(url: URL(string: urlString)!)
+        guard (deadlines[urlString] ?? .distantFuture) > Date() else { throw PlaybackSourceError.expired }
+        guard let url = URL(string: urlString) else { throw URLError(.badURL) }
+        var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.setValue("bytes=\(subrange.start)-\(subrange.end)", forHTTPHeaderField: "Range")
         request.setValue(referer, forHTTPHeaderField: "Referer")
         request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+        request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
         request.timeoutInterval = 15
 
         let startDate = Date()
@@ -988,49 +997,33 @@ actor MediaRangeDownloader {
             await recordFailure(host: host, category: classify(error: error, status: nil))
             throw error
         }
+        defer { asyncBytes.task.cancel() }
         // TTFB：首字节（响应头）到达耗时
         let ttfb = Date().timeIntervalSince(startDate)
-        guard let http = response as? HTTPURLResponse else {
-            await recordFailure(host: host, category: .network(NSError(domain: "cdn", code: -1)))
-            throw MediaRangeError.upstream(status: -1)
-        }
-        // 取消不计入失败：调用方已取消时直接退出
-        if Task.isCancelled {
-            throw CancellationError()
-        }
-        guard http.statusCode == 206 else {
-            await recordFailure(host: host, category: classify(error: nil, status: http.statusCode))
-            if http.statusCode == 403 || http.statusCode == 404 || http.statusCode == 416 {
-                // 403/404/416 分类，避免无限重复同一无效候选
+        try Task.checkCancellation()
+        let totalLength: Int64?
+        do {
+            totalLength = try MediaRangeParsing.validatePartialResponse(response, requested: subrange).total
+        } catch let MediaRangeError.upstream(status) {
+            await recordFailure(host: host, category: classify(error: nil, status: status))
+            if PlaybackSourceError.rejectionStatus(status) || status == 416 {
                 await isolateSingle(host: host)
             }
-            throw MediaRangeError.upstream(status: http.statusCode)
-        }
-        // Content-Range 校验
-        guard let contentRangeValue = http.value(forHTTPHeaderField: "Content-Range"),
-              let parsed = MediaRangeParsing.parseContentRange(contentRangeValue)
-        else {
-            // 200 或缺失 Content-Range：拒绝不正确响应，不交付
+            throw MediaRangeError.upstream(status: status)
+        } catch {
             await recordFailure(host: host, category: .mismatch)
-            throw MediaRangeError.mismatch
+            if case MediaRangeError.mismatch = error {
+                await isolateSingle(host: host)
+            }
+            throw error
         }
-        guard parsed.range == subrange else {
-            await recordFailure(host: host, category: .mismatch)
-            await isolateSingle(host: host)
-            throw MediaRangeError.mismatch
-        }
-        if let total = parsed.total {
+        if let total = totalLength {
             if let known = knownTotalLength, known != total {
                 await recordFailure(host: host, category: .mismatch)
                 await isolateSingle(host: host)
                 throw MediaRangeError.mismatch
             }
             knownTotalLength = total
-            // 区间不得超出总长
-            if subrange.end >= total {
-                await recordFailure(host: host, category: .mismatch)
-                throw MediaRangeError.unsatisfiable(total: total)
-            }
         }
         // 逐字节读取，测量有效吞吐；重复下载字节不计入有效吞吐由上层 extraBytes 区分
         var data = Data()

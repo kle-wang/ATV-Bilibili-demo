@@ -189,37 +189,15 @@ class FeedFlowBrowserViewController: UIViewController, BLTabBarContentVCProtocol
         resumePreviewIfNeeded()
     }
 
-    private var resignedActiveAt: Date?
-
     @objc private func handleAppWillResignActive() {
-        resignedActiveAt = Date()
         guard isViewLoaded, view.window != nil else { return }
         suspendPreview(cancelWarmups: true)
     }
 
     @objc private func handleAppDidBecomeActive() {
-        let idle = resignedActiveAt.map { Date().timeIntervalSince($0) } ?? 0
-        resignedActiveAt = nil
-        guard idle > VideoPlayerViewController.staleIdleInterval else {
-            guard isViewLoaded, view.window != nil else { return }
-            guard !autoReloadIfNeeded() else { return }
-            resumePreviewIfNeeded()
-            return
-        }
-        // 长时间待机后只刷新会过期的 CDN 播放地址：清掉地址缓存和预热资源，列表内容与位置保持不变。
-        // 预览要等缓存清完再开始，否则可能又拿到旧地址。
-        // 播放页在前面时由它自己原位换新地址；这里清缓存会取消它正在进行的请求，交给缓存过期机制兜底
-        guard presentedViewController == nil else { return }
-        Logger.info("[playurl] 沉浸式列表待机 \(Int(idle / 60)) 分钟，刷新播放地址（列表不变）")
-        Task { [weak self, playContextCache, mediaWarmupManager] in
-            await playContextCache.removeAll()
-            await mediaWarmupManager.cancelAll()
-            await MainActor.run {
-                guard let self, self.isViewLoaded, self.view.window != nil else { return }
-                guard !self.autoReloadIfNeeded() else { return }
-                self.resumePreviewIfNeeded()
-            }
-        }
+        guard isViewLoaded, view.window != nil, presentedViewController == nil else { return }
+        guard !autoReloadIfNeeded() else { return }
+        resumePreviewIfNeeded()
     }
 
     func reloadData() {
@@ -502,25 +480,11 @@ class FeedFlowBrowserViewController: UIViewController, BLTabBarContentVCProtocol
         previewTask = Task { [weak self] in
             guard let self else { return }
             try? await Task.sleep(nanoseconds: preloadDelayNs)
-            guard !Task.isCancelled else { return }
-            await playContextCache.preload(playInfo: item.playInfo, mode: .preview)
-            let neighboringItems = self.neighborPlayInfos(around: self.focusedIndex)
-            for neighbor in neighboringItems {
-                await playContextCache.preload(playInfo: neighbor, mode: .preview)
-            }
-            await playContextCache.trim(keeping: neighboringItems)
-            guard !Task.isCancelled else { return }
-            await MainActor.run {
-                guard !Task.isCancelled,
-                      self.presentedViewController == nil,
-                      self.isViewLoaded,
-                      self.view.window != nil
-                else { return }
-                guard self.items.indices.contains(self.focusedIndex),
-                      self.items[self.focusedIndex] == item
-                else { return }
-                self.installPreviewController(for: item)
-            }
+            guard !Task.isCancelled, presentedViewController == nil,
+                  isViewLoaded, view.window != nil,
+                  items.indices.contains(focusedIndex), items[focusedIndex] == item
+            else { return }
+            installPreviewController(for: item)
         }
     }
 
@@ -597,22 +561,12 @@ class FeedFlowBrowserViewController: UIViewController, BLTabBarContentVCProtocol
         }
     }
 
-    private func neighborPlayInfos(around index: Int) -> [PlayInfo] {
-        let lower = max(0, index - 1)
-        let upper = min(items.count - 1, index + 1)
-        guard !items.isEmpty, lower <= upper else { return [] }
-        return Array(items[lower...upper]).map(\.playInfo)
-    }
-
     private func prioritizedPlaybackWarmupInfos(for item: FeedFlowItem) -> [PlayInfo] {
         guard let index = items.firstIndex(of: item) else { return [item.playInfo] }
         var warmupInfos = [PlayInfo]()
         warmupInfos.append(items[index].playInfo)
         if items.indices.contains(index + 1) {
             warmupInfos.append(items[index + 1].playInfo)
-        }
-        if items.indices.contains(index - 1) {
-            warmupInfos.append(items[index - 1].playInfo)
         }
         return warmupInfos.uniqued()
     }
@@ -622,9 +576,8 @@ class FeedFlowBrowserViewController: UIViewController, BLTabBarContentVCProtocol
         await playContextCache.trim(keeping: warmupInfos)
         for info in warmupInfos {
             guard !Task.isCancelled else { return }
+            guard !info.isBangumi else { continue }
             await playContextCache.preload(playInfo: info, mode: .regular)
-            guard !Task.isCancelled else { return }
-            await mediaWarmupManager.preload(playInfo: info)
         }
     }
 

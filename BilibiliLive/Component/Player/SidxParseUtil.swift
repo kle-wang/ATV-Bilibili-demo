@@ -32,46 +32,39 @@ enum SidxParseUtil {
     }
 
     static func processIndexData(data: Data) -> Sidx? {
-        var offset: UInt64 = 0
-        var typeString = ""
-        var sidx: Sidx?
-        while offset < data.count - 8 {
+        let end = UInt64(data.endIndex)
+        var offset = UInt64(data.startIndex)
+        while end - offset >= 8 {
+            let boxStart = offset
             var size = UInt64(data.getUint32(offset: &offset))
-            let typeArr = data.getUint32(offset: &offset).toUInt8s
-            typeString = String(bytes: typeArr, encoding: .utf8)!
-            switch typeString {
-            case "sidx":
-                if size == 1 {
-                    size = data.getValue(type: UInt64.self, offset: &offset)
-                }
-                // size includes the 8-byte header (4 size + 4 type)
-                let boxDataSize = Int(size) - 8
-                let endIndex = Int(offset) + boxDataSize
-
-                guard endIndex <= data.count else {
-                    return nil
-                }
-
-                sidx = processSIDX(data: Data(data[Int(offset)..<endIndex]))
-                offset += UInt64(boxDataSize)
-            default:
-                if size == 1 {
-                    size = data.getValue(type: UInt64.self, offset: &offset)
-                }
-                offset += (size - 8)
+            let type = data.getUint32(offset: &offset)
+            if size == 1 {
+                guard end - offset >= 8 else { return nil }
+                size = data.getValue(type: UInt64.self, offset: &offset).bigEndian
+            } else if size == 0 {
+                size = end - boxStart
             }
+            guard size >= offset - boxStart, size <= end - boxStart else { return nil }
+            let boxEnd = boxStart + size
+            if type == 0x7369_6478 { // "sidx"
+                return processSIDX(data: Data(data[Int(offset)..<Int(boxEnd)]))
+            }
+            offset = boxEnd
         }
-        return sidx
+        return nil
     }
 
-    private static func processSIDX(data: Data) -> Sidx {
+    private static func processSIDX(data: Data) -> Sidx? {
+        guard data.count >= 24 else { return nil }
         var offset: UInt64 = 0
         let version = data.getUint8(offset: &offset)
+        guard version == 0 || (version == 1 && data.count >= 32) else { return nil }
         _ = data.getUint8(offset: &offset) // none
         _ = data.getUint8(offset: &offset) // none
         _ = data.getUint8(offset: &offset) // none
         _ = data.getUint32(offset: &offset) // refID
         let timescale = data.getUint32(offset: &offset)
+        guard timescale > 0 else { return nil }
 
         // version 0: 32-bit, version 1: 64-bit
         let earliest_presentation_time: UInt64
@@ -86,6 +79,10 @@ enum SidxParseUtil {
 
         _ = data.getValue(type: UInt16.self, offset: &offset).bigEndian // reversed
         let reference_count = data.getValue(type: UInt16.self, offset: &offset).bigEndian
+        guard Int(reference_count) <= (data.count - Int(offset)) / 12,
+              let firstOffset = Int(exactly: first_offset),
+              let earliestPresentationTime = Int(exactly: earliest_presentation_time)
+        else { return nil }
 
         var infos = [Sidx.SegmentInfo]()
         for _ in 0..<reference_count {
@@ -102,7 +99,7 @@ enum SidxParseUtil {
             infos.append(info)
         }
 
-        return Sidx(timescale: Int(timescale), firstOffset: Int(first_offset), earliestPresentationTime: Int(earliest_presentation_time), segments: infos)
+        return Sidx(timescale: Int(timescale), firstOffset: firstOffset, earliestPresentationTime: earliestPresentationTime, segments: infos)
     }
 }
 
@@ -117,10 +114,11 @@ extension Data {
 
     func getValue<T>(type: T.Type, offset: inout UInt64) -> T {
         let size = UInt64(MemoryLayout<T>.size)
+        let byteOffset = Int(offset) - startIndex
         defer {
             offset += size
         }
-        return Data(self[offset..<size + offset]).withUnsafeBytes({ $0.load(as: T.self) })
+        return withUnsafeBytes { $0.loadUnaligned(fromByteOffset: byteOffset, as: T.self) }
     }
 }
 

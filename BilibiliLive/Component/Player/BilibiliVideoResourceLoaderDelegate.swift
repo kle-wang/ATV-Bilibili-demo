@@ -6,7 +6,6 @@
 //  Copyright © 2022 yicheng. All rights reserved.
 //
 
-import Alamofire
 import AVFoundation
 import Swifter
 import SwiftyJSON
@@ -25,6 +24,7 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
         let info: VideoPlayURLInfo.DashInfo.DashMediaInfo
         let url: String
         let duration: Int
+        var isTrickPlay = false
     }
 
     private var audioPlaylist = ""
@@ -53,10 +53,55 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
     private(set) var isHDR = false
     /// 首选视频流的全部 CDN 候选，按 host 去重，供 CDNDiagnostics 实测
     private(set) var cdnCandidates = [String]()
-    /// 首选视频流的声明带宽（bps），access log 的 indicatedBitrate 尚未就绪时作健康检测兜底
-    private(set) var primaryVideoBandwidth = 0
-    /// 最近一次生成媒体播放列表时实际选用的分片 host
-    private(set) var currentSegmentHost: String?
+    private var source: PlaybackSource?
+    private typealias MediaRoute = (info: PlaybackInfo, url: String, proxied: Bool)
+    private var videoRoute: MediaRoute?
+    private var audioRoute: MediaRoute?
+    private var recentRejection: (status: Int, uptime: TimeInterval)?
+
+    var currentSegmentHost: String? {
+        diagLock.lock()
+        defer { diagLock.unlock() }
+        return (videoRoute?.url ?? videoInfo.first?.url).flatMap { URLComponents(string: $0)?.host }
+    }
+
+    var rejectedStatus: Int? {
+        diagLock.lock()
+        defer { diagLock.unlock() }
+        guard let recentRejection, ProcessInfo.processInfo.systemUptime - recentRejection.uptime < 30 else { return nil }
+        return recentRejection.status
+    }
+
+    func canKeepCurrentRoutes(allowNearExpiry: Bool = false) -> Bool {
+        guard let source else { return false }
+        diagLock.lock()
+        let video = videoRoute ?? videoInfo.first.map { ($0, $0.url, false) }
+        let audio = audioRoute ?? videoInfo.first(where: { $0.info.mime_type.hasPrefix("audio/") }).map { ($0, $0.url, false) }
+        diagLock.unlock()
+        return [video, audio].compactMap { $0 }.allSatisfy { route in
+            if route.proxied, let id = proxyRegistry.id(for: route.info.info),
+               let candidates = proxyRegistry.snapshot(for: id)?.candidates
+            {
+                return candidates.contains { source.isUsable($0, allowNearExpiry: allowNearExpiry) }
+            }
+            return source.isUsable(route.url, allowNearExpiry: allowNearExpiry)
+        }
+    }
+
+    func backupHost(failingURI: String? = nil) -> String? {
+        guard let source else { return nil }
+        let failingHost = failingURI.flatMap { URLComponents(string: $0)?.host }
+        diagLock.lock()
+        let video = videoRoute ?? videoInfo.first.map { ($0, $0.url, false) }
+        let audio = audioRoute
+        diagLock.unlock()
+        let audioHost = audio.flatMap { URLComponents(string: $0.url)?.host }
+        let route = failingHost != nil && failingHost == audioHost ? audio : video
+        guard let (track, currentURL, _) = route else { return nil }
+        let currentHost = failingHost ?? URLComponents(string: currentURL)?.host
+        return source.urls(for: track.info).lazy.compactMap { URLComponents(string: $0)?.host }.first { $0 != currentHost }
+    }
+
     /// 实际传输模式（内部执行模式，非用户设置）。默认 .direct 保持原行为。
     private(set) var transportMode: MediaTransportMode = .direct
     /// 播放器实际生效的传输模式：代理启动失败时播放列表已回退直连 URI，
@@ -89,6 +134,24 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
     private func updateAccelerationText(_ text: String) {
         diagLock.lock()
         _accelerationText = text
+        diagLock.unlock()
+    }
+
+    private func recordRoute(_ info: PlaybackInfo, url: String, proxied: Bool) {
+        guard !info.isTrickPlay else { return }
+        diagLock.lock()
+        if info.info.mime_type.hasPrefix("audio/") {
+            audioRoute = (info, url, proxied)
+        } else {
+            videoRoute = (info, url, proxied)
+        }
+        diagLock.unlock()
+    }
+
+    private func recordRejection(_ status: Int) {
+        guard PlaybackSourceError.rejectionStatus(status) else { return }
+        diagLock.lock()
+        recentRejection = (status, ProcessInfo.processInfo.systemUptime)
         diagLock.unlock()
     }
 
@@ -205,12 +268,10 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
     private func collectCDNCandidates(from video: VideoPlayURLInfo.DashInfo.DashMediaInfo?) {
         guard let video else {
             cdnCandidates = []
-            primaryVideoBandwidth = 0
             return
         }
-        primaryVideoBandwidth = video.bandwidth
         var seenHosts = Set<String>()
-        cdnCandidates = video.playableURLs.filter { url in
+        cdnCandidates = (source?.urls(for: video) ?? []).filter { url in
             guard let host = URLComponents(string: url)?.host else { return false }
             return seenHosts.insert(host).inserted
         }
@@ -224,17 +285,18 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
         Logger.info("cdn candidates for qn \(video.id) (\(video.bandwidth / 1000)kbps):\n\(detail)")
     }
 
-    private func getVideoPlayList(info: PlaybackInfo) async -> String {
-        let sidxResult = await segmentInfoCache.sidx(from: info.info, preferredHost: preferredHost)
+    private func getVideoPlayList(info: PlaybackInfo) async throws -> String {
+        let sidxResult = try await loadIndex(for: info.info)
+        let segmentURL = sidxResult.url
         let inits = info.info.segment_base.initialization.components(separatedBy: "-")
         guard let moovIdxStr = inits.last,
               let moovIdx = Int(moovIdxStr),
               let moovOffset = inits.first,
               let offsetStr = info.info.segment_base.index_range.components(separatedBy: "-").last,
               var offset = Int(offsetStr),
-              let sidxResult = sidxResult
+              let segment = sidxResult.sidx
         else {
-            currentSegmentHost = URLComponents(string: info.url)?.host
+            recordRoute(info, url: segmentURL, proxied: false)
             return """
             #EXTM3U
             #EXT-X-VERSION:7
@@ -243,16 +305,13 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
             #EXT-X-INDEPENDENT-SEGMENTS
             #EXT-X-PLAYLIST-TYPE:VOD
             #EXTINF:\(info.duration)
-            \(info.url)
+            \(segmentURL)
             #EXT-X-ENDLIST
             """
         }
 
         // 使用 sidx 实际下载成功的 URL——它已经完成了对 CDN 可用性的探测，
         // 首选 CDN 挂掉时 segment 会整体切到探测成功的备用 URL
-        let segment = sidxResult.sidx
-        let segmentURL = sidxResult.url
-        currentSegmentHost = URLComponents(string: segmentURL)?.host
         // sidx 索引字节作为跨 CDN 等价性验证的信任锚点：它是播放前已从探测
         // 成功的 URL 取回的原始字节，后续各 CDN 的同区间样本必须与之逐字节一致。
         // 锚点设置与媒体请求并发进行，先到的下载请求可能回退为双边采样，不影响正确性。
@@ -264,7 +323,9 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
         }
         // 代理启用且媒体已成功注册时，用本地 HTTP URL 替换 CDN 地址；
         // 保留原 Range、分段持续时间和全部 HLS 标签。SIDX 失败回退分支保持直连。
-        let mediaURL = mediaTransportURL(for: info.info) ?? segmentURL
+        let proxyURL = mediaTransportURL(for: info.info)
+        recordRoute(info, url: segmentURL, proxied: proxyURL != nil)
+        let mediaURL = proxyURL ?? segmentURL
         var playList = """
         #EXTM3U
         #EXT-X-VERSION:7
@@ -379,7 +440,9 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
         playlists.append(playList)
     }
 
-    func setBilibili(info: VideoPlayURLInfo, subtitles: [SubtitleData], aid: Int, maxQuality: Int? = nil, streamIndex: Int? = nil, preferredHost: String? = nil, transportMode: MediaTransportMode = .direct) {
+    func setBilibili(source: PlaybackSource, subtitles: [SubtitleData], aid: Int, maxQuality: Int? = nil, streamIndex: Int? = nil, preferredHost: String? = nil, transportMode: MediaTransportMode = .direct, startLower: Bool = false) throws {
+        let info = source.info
+        self.source = source
         playInfo = info
         self.aid = aid
         self.preferredHost = preferredHost
@@ -388,7 +451,8 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
         // reset() 会清 proxyAvailable；恢复本会话的模式（reset 后设置，避免被清掉）
         self.transportMode = transportMode
         hasSubtitle = subtitles.count > 0
-        var videos = info.dash.video
+        let availableVideos = info.dash.video.filter { !source.urls(for: $0).isEmpty }
+        var videos = availableVideos
         if Settings.preferAvc {
             let videosMap = Dictionary(grouping: videos, by: { $0.id })
             for (key, values) in videosMap {
@@ -405,7 +469,7 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
         // 1. 如果用户手动选择了具体的流（streamIndex 不为 nil），只使用该流
         // 2. 如果用户手动选择了画质（maxQuality 不为 nil），只保留该画质的流（强制模式）
         // 3. 如果是默认模式，使用设置限制并保留多级画质作为后备（自适应模式）
-        if let streamIndex = streamIndex, streamIndex < info.dash.video.count {
+        if let streamIndex, info.dash.video.indices.contains(streamIndex) {
             // 用户选择了具体的流，直接使用该流
             videos = [info.dash.video[streamIndex]]
         } else if let maxQuality = maxQuality {
@@ -440,40 +504,42 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
             videos = highQualityVideos + fallbackVideos + emergencyVideos
         }
 
+        let validVideos = videos.filter { !source.urls(for: $0).isEmpty }
+        if validVideos.isEmpty {
+            if availableVideos.isEmpty || !videos.isEmpty || maxQuality.map({ qn in info.dash.video.contains { $0.id == qn } }) == true {
+                throw PlaybackSourceError.expired
+            }
+            throw PlaybackSourceError.noPlayableStreams
+        }
+        videos = validVideos
+
         // 按 bandwidth 降序排序，同一画质+编码只保留码率最高的一条
         videos.sort { $0.bandwidth > $1.bandwidth }
         var seenVariants = Set<String>()
         videos = videos.filter { seenVariants.insert("\($0.id)-\($0.codecs)").inserted }
 
-        collectCDNCandidates(from: videos.first)
-
         // AVPlayer 用 master playlist 里第一个 variant 起播。过去最高画质（4K 30~44Mbps）排第一，
         // 起播要从 4K 逐档降到能播的档位，白白耗掉 3~5s。这里把码率适中的一档放到第一位，
         // 播起来后再由 AVPlayer 按实测带宽自动升档。
-        if videos.count > 1, let startIndex = Self.startupVariantIndex(in: videos) {
+        if videos.count > 1, let startIndex = startLower ? videos.indices.last : Self.startupVariantIndex(in: videos) {
             let start = videos.remove(at: startIndex)
             videos.insert(start, at: 0)
             Logger.info("startup variant qn \(start.id) \(start.bandwidth / 1000)kbps (observed \(Int(PlaybackThroughputEstimator.observedBps / 1000))kbps)")
         }
+        collectCDNCandidates(from: videos.first)
 
         // 每档只写一条 variant（该流的首选 URL）。备用 CDN 由 sidx 下载时的多地址回退
         // 和播放中的换节点逻辑处理，不再在 master 里按 host 重复列同一档。
         for video in videos {
-            if let url = video.playableURLs.first {
+            if let url = source.urls(for: video).first {
                 addVideoPlayBackInfo(info: video, url: url, duration: info.dash.duration)
             }
         }
 
         if Settings.losslessAudio {
-            if let audios = info.dash.dolby?.audio {
-                // 只添加第一个杜比音频流的第一个 URL
-                if let firstAudio = audios.first,
-                   let firstUrl = BVideoUrlUtils.sortUrls(base: firstAudio.base_url, backup: firstAudio.backup_url).first
-                {
-                    addAudioPlayBackInfo(info: firstAudio, url: firstUrl, duration: info.dash.duration)
-                }
-            } else if let audio = info.dash.flac?.audio,
-                      let firstUrl = audio.playableURLs.first
+            let lossless = (info.dash.dolby?.audio ?? []) + [info.dash.flac?.audio].compactMap { $0 }
+            if let audio = lossless.first(where: { !source.urls(for: $0).isEmpty }),
+               let firstUrl = source.urls(for: audio).first
             {
                 // 只添加第一个 FLAC 音频 URL
                 addAudioPlayBackInfo(info: audio, url: firstUrl, duration: info.dash.duration)
@@ -481,10 +547,13 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
         }
 
         // 只添加第一个普通音频流的第一个 URL
-        if let firstAudio = info.dash.audio?.first,
-           let firstUrl = firstAudio.playableURLs.first
+        if let firstAudio = info.dash.audio?.first(where: { !source.urls(for: $0).isEmpty }),
+           let firstUrl = source.urls(for: firstAudio).first
         {
             addAudioPlayBackInfo(info: firstAudio, url: firstUrl, duration: info.dash.duration)
+        }
+        if !hasAudioInMasterListAdded, let audio = info.dash.audio, !audio.isEmpty {
+            throw PlaybackSourceError.expired
         }
 
         if hasSubtitle || transportMode != .direct {
@@ -512,13 +581,15 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
         }
 
         // i-frame
-        if let video = videos.last, let url = video.playableURLs.first {
+        if let video = videos.last, let url = source.urls(for: video).first,
+           let width = video.width, let height = video.height
+        {
             let media = """
-            #EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=\(Self.peakBandwidth(forAverage: video.bandwidth)),RESOLUTION=\(video.width!)x\(video.height!),URI="\(URLs.customDashPrefix)\(videoInfo.count)"
+            #EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=\(Self.peakBandwidth(forAverage: video.bandwidth)),RESOLUTION=\(width)x\(height),URI="\(URLs.customDashPrefix)\(videoInfo.count)"
 
             """
             masterPlaylist.append(media)
-            videoInfo.append(PlaybackInfo(info: video, url: url, duration: info.dash.duration))
+            videoInfo.append(PlaybackInfo(info: video, url: url, duration: info.dash.duration, isTrickPlay: true))
         }
 
         masterPlaylist.append("\n#EXT-X-ENDLIST\n")
@@ -526,9 +597,13 @@ class BilibiliVideoResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelega
         Logger.debug("masterPlaylist: \(masterPlaylist)")
     }
 
-    func prewarmPrimaryVideoIndex() async {
-        guard let firstVideo = videoInfo.first else { return }
-        _ = await segmentInfoCache.sidx(from: firstVideo.info, preferredHost: preferredHost)
+    private func loadIndex(for media: VideoPlayURLInfo.DashInfo.DashMediaInfo) async throws -> SidxDownloader.SidxResult {
+        guard let source else { throw PlaybackSourceError.noPlayableStreams }
+        let urls = source.urls(for: media)
+        guard !urls.isEmpty else { throw PlaybackSourceError.expired }
+        let result = try await segmentInfoCache.sidx(from: media, urls: urls, referer: Keys.referer(for: aid), preferredHost: preferredHost)
+        guard source.isUsable(result.url, allowNearExpiry: true) else { throw PlaybackSourceError.expired }
+        return result
     }
 
     func cancelPendingIndexLoads() {
@@ -593,7 +668,14 @@ private extension BilibiliVideoResourceLoaderDelegate {
             }
             let info = videoInfo[index]
             Task {
-                report(loadingRequest, content: await getVideoPlayList(info: info))
+                do {
+                    try report(loadingRequest, content: await getVideoPlayList(info: info))
+                } catch let PlaybackSourceError.cdnRejected(status) {
+                    recordRejection(status)
+                    loadingRequest.finishLoading(with: NSError(domain: NSURLErrorDomain, code: NSURLErrorBadServerResponse))
+                } catch {
+                    loadingRequest.finishLoading(with: error)
+                }
             }
             return
         }
@@ -673,7 +755,7 @@ private extension BilibiliVideoResourceLoaderDelegate {
         for entry in videoInfo {
             let media = entry.info
             guard seen.insert(media).inserted else { continue }
-            let candidates = media.playableURLs
+            let candidates = source?.urls(for: media) ?? []
             guard !candidates.isEmpty else { continue }
             let mode: MediaTransportMode = transportMode == .accelerated ? .accelerated : .proxy
             let downloader = MediaRangeDownloader(candidates: candidates, referer: referer, mode: mode)
@@ -703,12 +785,13 @@ private extension BilibiliVideoResourceLoaderDelegate {
         }
         let rangeHeader = req.headers["range"]
         let parsed = MediaRangeParsing.parse(header: rangeHeader, fileLength: entry.totalLength)
+        let fallback = entry.candidates.first { (PlaybackSource.deadline(for: $0) ?? .distantFuture) > Date() }
         switch parsed {
         case .missing:
             // 无 Range 的整文件请求：307 重定向回原 CDN，不伪造 206。
             // 注意：Swifter 的 movedTemporarily 实际发送 307；AVPlayer 是否保留
             // Range 语义跟随跳转仍需真机验证（见验收 P2）。
-            if let fallback = entry.candidates.first, URL(string: fallback) != nil {
+            if let fallback {
                 return HttpResponse.movedTemporarily(fallback)
             }
             return HttpResponse.badRequest(nil)
@@ -730,14 +813,14 @@ private extension BilibiliVideoResourceLoaderDelegate {
                 let headers = MediaRangeResponseHeaders.rangeNotSatisfiable(totalLength: total)
                 return HttpResponse.raw(416, "Range Not Satisfiable", headers, nil)
             }
-            if let fallback = entry.candidates.first {
+            if let fallback {
                 return HttpResponse.movedTemporarily(fallback)
             }
             return HttpResponse.badRequest(nil)
         case let .single(range):
             // 超出安全容量的请求降级直连（PR2 的流式输出仍以 16MiB 为单请求上限）
             if range.length > 16 * 1024 * 1024 {
-                if let fallback = entry.candidates.first {
+                if let fallback {
                     return HttpResponse.movedTemporarily(fallback)
                 }
                 return HttpResponse.badRequest(nil)
@@ -751,9 +834,7 @@ private extension BilibiliVideoResourceLoaderDelegate {
         // 是否接受 bytes start-end/* 仍需真机验证（见验收 P2）。后续请求复用已缓存的 total。
         let headers = MediaRangeResponseHeaders.partialContent(range: range, totalLength: entry.totalLength)
         let downloader = entry.downloader
-        let candidates = entry.candidates
-        weak var weakSelf = self
-        return HttpResponse.raw(206, "Partial Content", headers) { writer in
+        return HttpResponse.raw(206, "Partial Content", headers) { [weak self] writer in
             let pipe = MediaBytePipe()
             let streamTask = Task {
                 await downloader.stream(range: range, to: pipe)
@@ -763,12 +844,7 @@ private extension BilibiliVideoResourceLoaderDelegate {
             do {
                 while true {
                     let chunk: Data?
-                    do {
-                        chunk = try pipe.readSync(maxLength: 64 * 1024, timeout: 30)
-                    } catch {
-                        streamTask.cancel()
-                        throw error
-                    }
+                    chunk = try pipe.readSync(maxLength: 64 * 1024, timeout: 30)
                     guard let chunk else { break }
                     do {
                         try writer.write(chunk)
@@ -780,18 +856,22 @@ private extension BilibiliVideoResourceLoaderDelegate {
                 }
             } catch {
                 streamTask.cancel()
+                if case let MediaBytePipe.PipeError.failed(upstream) = error,
+                   case let MediaRangeError.upstream(status) = upstream
+                {
+                    self?.recordRejection(status)
+                }
                 // 206 已发送：不能改写状态码，只能截断；播放器级恢复由 BVideoPlayPlugin 触发
                 throw error
             }
             // 成功交付后异步更新诊断与 total 缓存（不阻塞 writer）
-            Task { [weakSelf, downloader, candidates, mediaID] in
+            Task { [weak self] in
                 if let total = await downloader.knownTotal() {
-                    weakSelf?.proxyRegistry.updateTotalLength(total, for: mediaID)
+                    self?.proxyRegistry.updateTotalLength(total, for: mediaID)
                 }
-                if let diag = await weakSelf?.buildAccelerationText(downloader: downloader) {
-                    weakSelf?.updateAccelerationText(diag)
+                if let diag = await self?.buildAccelerationText(downloader: downloader) {
+                    self?.updateAccelerationText(diag)
                 }
-                _ = candidates
             }
         }
     }
@@ -898,7 +978,7 @@ enum BVideoUrlUtils {
         if let backup {
             urls.append(contentsOf: backup)
         }
-        // 只把 PCDN 垫底；其余保持 API 返回顺序，具体快慢交给动态测速
+        // 只把 PCDN 垫底；其余保持 API 返回顺序。
         return urls.enumerated()
             .sorted { (tier($0.element), $0.offset) < (tier($1.element), $1.offset) }
             .map(\.element)
@@ -955,25 +1035,18 @@ extension VideoPlayURLInfo.DashInfo.DashMediaInfo {
 
 actor SidxDownloader {
     struct SidxResult {
-        let sidx: SidxParseUtil.Sidx
+        let sidx: SidxParseUtil.Sidx?
         let url: String
         /// 索引区间的原始字节（等价性验证的信任锚点，不参与播放数据）。
         let indexBytes: Data
     }
 
     private enum CacheEntry {
-        case inProgress(token: UUID, task: Task<SidxResult?, Never>)
+        case inProgress(token: UUID, task: Task<SidxResult, Error>)
         case ready(SidxResult)
     }
 
-    // sidx 只有几 KB，用短超时的独立 Session，避免默认 60s 超时把起播卡死
-    private static let session: Session = {
-        let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = 6
-        config.timeoutIntervalForResource = 10
-        config.headers = HTTPHeaders(["User-Agent": Keys.userAgent])
-        return Session(configuration: config)
-    }()
+    private static let session = CDNDiagnostics.session(requestTimeout: 2, resourceTimeout: 3)
 
     private let maxEntries: Int
     private var cache: [VideoPlayURLInfo.DashInfo.DashMediaInfo: CacheEntry] = [:]
@@ -983,43 +1056,42 @@ actor SidxDownloader {
         self.maxEntries = maxEntries
     }
 
-    func sidx(from info: VideoPlayURLInfo.DashInfo.DashMediaInfo, preferredHost: String? = nil) async -> SidxResult? {
+    func sidx(from info: VideoPlayURLInfo.DashInfo.DashMediaInfo, urls: [String], referer: String, preferredHost: String?) async throws -> SidxResult {
         if let cached = cache[info] {
             touch(info)
             switch cached {
-            case let .ready(sidx):
-                Logger.debug("sidx cache hit \(info.id)")
+            case let .ready(sidx) where urls.contains(sidx.url):
                 return sidx
+            case .ready:
+                break
             case let .inProgress(_, task):
-                Logger.debug("sidx cache wait \(info.id)")
-                return await task.value
+                return try await task.value
             }
         }
 
         let token = UUID()
-        let task = Task<SidxResult?, Never> {
-            guard !Task.isCancelled else { return nil }
-            return await downloadSidx(info: info, preferredHost: preferredHost)
+        let task = Task {
+            try await Self.downloadSidx(info: info, urls: urls, referer: referer, preferredHost: preferredHost)
         }
 
         cache[info] = .inProgress(token: token, task: task)
         touch(info)
 
-        let sidx = await task.value
+        let result = await task.result
         guard case let .inProgress(currentToken, _) = cache[info],
               currentToken == token
         else {
-            return nil
+            throw CancellationError()
         }
-        if let sidx {
+        if case let .success(sidx) = result {
             cache[info] = .ready(sidx)
         } else {
             cache[info] = nil
             accessOrder.removeAll { $0 == info }
         }
         trimToCapacity()
-        Logger.debug("get sidx \(info.id)")
-        return sidx
+        try Task.checkCancellation()
+        return try result.get()
     }
 
     func cancelAll() {
@@ -1030,10 +1102,6 @@ actor SidxDownloader {
         }
         cache.removeAll()
         accessOrder.removeAll()
-    }
-
-    private func elapsedMs(since date: Date) -> Int {
-        Int(Date().timeIntervalSince(date) * 1000)
     }
 
     private func touch(_ info: VideoPlayURLInfo.DashInfo.DashMediaInfo) {
@@ -1051,34 +1119,51 @@ actor SidxDownloader {
         }
     }
 
-    private func downloadSidx(info: VideoPlayURLInfo.DashInfo.DashMediaInfo, preferredHost: String? = nil) async -> SidxResult? {
-        let range = info.segment_base.index_range
-        var urls = info.playableURLs
-        // sidx 只有几 KB，探测到的只是延迟不是吞吐；运行时如果发现当前 host 扛不住实际码率，
-        // 由外部指定 preferredHost 时强制优先试这个 host
+    private static func downloadSidx(info: VideoPlayURLInfo.DashInfo.DashMediaInfo,
+                                     urls candidates: [String], referer: String, preferredHost: String?) async throws -> SidxResult
+    {
+        var urls = candidates
         if let preferredHost,
            let idx = urls.firstIndex(where: { URLComponents(string: $0)?.host == preferredHost })
         {
             urls.insert(urls.remove(at: idx), at: 0)
         }
-        for url in urls.prefix(3) {
-            guard !Task.isCancelled else { return nil }
-            let host = URLComponents(string: url)?.host ?? url
-            let start = Date()
-            if let res = try? await Self.session.request(url,
-                                                         headers: ["Range": "bytes=\(range)",
-                                                                   "Referer": "https://www.bilibili.com/"])
-                .serializingData().result.get(),
-                !Task.isCancelled,
-                let segment = SidxParseUtil.processIndexData(data: res),
-                !segment.segments.isEmpty
-            {
-                Logger.info("sidx ok in \(elapsedMs(since: start))ms from \(host)")
-                return SidxResult(sidx: segment, url: url, indexBytes: res)
-            }
-            Logger.warn("sidx download failed in \(elapsedMs(since: start))ms on \(host), try next url")
+        guard let first = urls.first else { throw PlaybackSourceError.expired }
+        guard case let .single(range) = MediaRangeParsing.parse(header: "bytes=\(info.segment_base.index_range)", fileLength: nil) else {
+            // Streams without an index keep the existing whole-file fallback.
+            return SidxResult(sidx: nil, url: first, indexBytes: Data())
         }
-        return nil
+        guard range.length <= 2 * 1024 * 1024 else { throw MediaRangeError.invalidRange }
+        var fallback: SidxResult?
+        var lastError: Error = URLError(.cannotLoadFromNetwork)
+        var rejectedStatus: Int?
+        for url in urls.prefix(3) {
+            try Task.checkCancellation()
+            let host = URLComponents(string: url)?.host ?? "unknown"
+            let lease = PlaybackSource.deadline(for: url).map { String(format: "%.0fs", $0.timeIntervalSinceNow) } ?? "unknown"
+            let started = ProcessInfo.processInfo.systemUptime
+            do {
+                let sample = try await CDNDiagnostics.fetchRange(url: url, range: range, referer: referer, session: session)
+                let elapsed = Int((sample.setupTime + sample.transferTime) * 1000)
+                if let segment = SidxParseUtil.processIndexData(data: sample.data), !segment.segments.isEmpty {
+                    Logger.info("sidx ok in \(elapsed)ms from \(host) TTL \(lease)")
+                    return SidxResult(sidx: segment, url: url, indexBytes: sample.data)
+                }
+                Logger.warn("sidx parse failed after HTTP 206 in \(elapsed)ms from \(host) TTL \(lease)")
+                if fallback == nil { fallback = SidxResult(sidx: nil, url: url, indexBytes: Data()) }
+            } catch {
+                try Task.checkCancellation()
+                let elapsed = Int((ProcessInfo.processInfo.systemUptime - started) * 1000)
+                Logger.warn("sidx download failed in \(elapsed)ms on \(host) TTL \(lease): \(CDNDiagnostics.errorLabel(error))")
+                lastError = error
+                if case let .upstream(status) = error as? MediaRangeError, PlaybackSourceError.rejectionStatus(status) {
+                    rejectedStatus = status
+                }
+            }
+        }
+        if let fallback { return fallback }
+        if let rejectedStatus { throw PlaybackSourceError.cdnRejected(status: rejectedStatus) }
+        throw lastError
     }
 }
 

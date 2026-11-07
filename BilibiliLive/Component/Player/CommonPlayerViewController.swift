@@ -192,6 +192,7 @@ extension CommonPlayerViewController {
     }
 
     private func playerRateDidChange(player: AVPlayer) {
+        guard playerVC.player === player else { return }
         if player.rate > 0 {
             activePlugins.forEach { $0.playerDidStart(player: player) }
             playerDidStart(player: player)
@@ -204,29 +205,22 @@ extension CommonPlayerViewController {
 
     private func observePlayerItem(_ playerItem: AVPlayerItem) {
         // .initial：预缓冲接手的播放器在挂上时可能已是 readyToPlay，不会再收到变化通知
-        statusObserver = playerItem.observe(\.status, options: [.initial, .new, .old]) {
-            [weak self] item, _ in
-            guard let self, let player = playerVC.player else { return }
-            switch item.status {
-            case .readyToPlay:
-                isEnd = false
-                activePlugins.forEach { $0.playerWillStart(player: player) }
-                playerWillStart(player: player)
-                if autoPlayWhenReady {
-                    player.play()
+        statusObserver = playerItem.observe(\.status, options: [.initial, .new]) {
+            [weak self] item, change in
+            guard let status = change.newValue, status != .unknown else { return }
+            if Thread.isMainThread {
+                MainActor.assumeIsolated { self?.playerItemStatusDidChange(item, status: status) }
+            } else {
+                DispatchQueue.main.async { [weak self] in
+                    self?.playerItemStatusDidChange(item, status: status)
                 }
-            case .failed:
-                activePlugins.forEach { $0.playerDidFail(player: player) }
-                playerDidFail(player: player)
-            default:
-                break
             }
         }
         if let playToEndObserver {
             NotificationCenter.default.removeObserver(playToEndObserver)
         }
-        playToEndObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: playerItem, queue: .main) { [weak self] note in
-            guard let self, let player = playerVC.player else { return }
+        playToEndObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: playerItem, queue: .main) { [weak self] _ in
+            guard let self, let player = playerVC.player, player.currentItem === playerItem else { return }
             isEnd = true
             activePlugins.forEach { $0.playerDidEnd(player: player) }
             playerDidEnd(player: player)
@@ -235,9 +229,27 @@ extension CommonPlayerViewController {
             NotificationCenter.default.removeObserver(playbackStalledObserver)
         }
         playbackStalledObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemPlaybackStalled, object: playerItem, queue: .main) { [weak self] _ in
-            guard let self, let player = playerVC.player else { return }
+            guard let self, let player = playerVC.player, player.currentItem === playerItem else { return }
             activePlugins.forEach { $0.playerDidStall(player: player) }
             playerDidStall(player: player)
+        }
+    }
+
+    private func playerItemStatusDidChange(_ item: AVPlayerItem, status: AVPlayerItem.Status) {
+        guard let player = playerVC.player, player.currentItem === item, item.status == status else { return }
+        switch status {
+        case .readyToPlay:
+            isEnd = false
+            activePlugins.forEach { $0.playerWillStart(player: player) }
+            playerWillStart(player: player)
+            if autoPlayWhenReady {
+                player.play()
+            }
+        case .failed:
+            activePlugins.forEach { $0.playerDidFail(player: player) }
+            playerDidFail(player: player)
+        default:
+            break
         }
     }
 }
